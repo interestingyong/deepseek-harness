@@ -1,0 +1,58 @@
+.agents/notes/implemented/feature/2026-09-11-composer-pgup-pgdn-draft-recall.i18n.yaml
+  h_c7c52bcf9e03a5 1-6
+.agents/notes/implemented/feature/2026-09-11-composer-pgup-pgdn-draft-recall.md
+  h_c7c52bcf9e03a5 1-33
+.agents/notes/implemented/feature/2026-09-11-composer-pgup-pgdn-draft-recall.zh.md
+  h_c7c52bcf9e03a5 1-33
+packages/client/ui-conversation/README.i18n.yaml
+  h_c7c52bcf9e03a5 5-6
+packages/client/ui-conversation/README.md
+  h_c7c52bcf9e03a5 47
+packages/client/ui-conversation/README.zh.md
+  h_c7c52bcf9e03a5 47
+packages/client/ui-conversation/src/client/apply.ts
+  h_c7c52bcf9e03a5 269
+packages/client/ui-conversation/src/client/contract/input.ts
+  h_c7c52bcf9e03a5 79-81,286-292
+packages/client/ui-conversation/src/client/contract/slots.ts
+  h_c7c52bcf9e03a5 274-275
+packages/client/ui-conversation/src/client/contract/views.ts
+  h_c7c52bcf9e03a5 21-26
+packages/client/ui-conversation/src/client/input/editor/keymap.ts
+  h_c7c52bcf9e03a5 9-16,27,29,31-83,101-105,136-152,159-172,183-186
+packages/client/ui-conversation/src/client/input/facade.ts
+  h_c7c52bcf9e03a5 25-26,158-165,368-369,402-406,452-488,662-678
+packages/client/ui-conversation/src/client/skeleton/ConversationSession.tsx
+  h_c7c52bcf9e03a5 3,170,180-184,189-196
+packages/client/ui-conversation/src/client/skeleton/InputBar.tsx
+  h_c7c52bcf9e03a5 268,272,311-316
+packages/client/ui-conversation/src/client/stores.ts
+  h_c7c52bcf9e03a5 8-10,14,26,30-37
+packages/client/ui-conversation/tests/apply-inject.client.spec.tsx
+  h_c7c52bcf9e03a5 120
+packages/client/ui-conversation/tests/conversation-store.client.spec.ts
+  h_c7c52bcf9e03a5 15,23
+packages/client/ui-conversation/tests/history-recall.client.spec.ts
+  h_c7c52bcf9e03a5 1-146
+packages/client/ui-conversation/tests/input-bar.client.spec.tsx
+  h_c7c52bcf9e03a5 12,20,1694-1784
+packages/client/ui-conversation/tests/keymap-routing.client.spec.tsx
+  h_c7c52bcf9e03a5 30,57,67-101
+packages/client/ui-conversation/tests/selection-survival.client.spec.tsx
+  h_c7c52bcf9e03a5 85
+packages/client/ui-conversation/tests/skeleton.client.spec.tsx
+  h_c7c52bcf9e03a5 240
+packages/client/ui-trajectory/tests/views.client.spec.tsx
+  h_c7c52bcf9e03a5 413
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "55325a9a6e48feb8d3061f0978995983ea435bbf",
+  "prompts": {},
+  "humans": {
+    "h_c7c52bcf9e03a5": {
+      "author": "wangyong27 <wangyong27@lenovo.com>"
+    }
+  }
+}
