@@ -12,7 +12,7 @@ beforeEach(() => {
 describe('createConversationStore', () => {
   it('owns draft, selected View, and one-shot View requests', () => {
     const store = createConversationStore().create()
-    expect(store.store.getSnapshot()).toEqual({ draft: '', view: null, viewRequest: null })
+    expect(store.store.getSnapshot()).toEqual({ draft: '', view: null, viewRequest: null, history: [] })
 
     store.actions.setDraft('hello')
     store.actions.setView('chat')
@@ -20,6 +20,7 @@ describe('createConversationStore', () => {
       draft: 'hello',
       view: 'chat',
       viewRequest: null,
+      history: [],
     })
 
     store.actions.openView('trajectory', 'call-1')

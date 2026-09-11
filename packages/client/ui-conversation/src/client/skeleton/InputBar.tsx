@@ -265,11 +265,11 @@ export const InputBar = memo(function InputBar({
   // The keymap handlers read live bar state through this ref so the editor
   // registration survives re-renders without re-arming per keystroke.
   const gate = useRef({
-    locked, machineBusy, canSteerQueue, running, steeringAvailable, busyEnter,
+    locked, machineBusy, commandMenuOpen, canSteerQueue, running, steeringAvailable, busyEnter,
     intakeFiles, uploadsPending, showToast, t,
   })
   gate.current = {
-    locked, machineBusy, canSteerQueue, running, steeringAvailable, busyEnter,
+    locked, machineBusy, commandMenuOpen, canSteerQueue, running, steeringAvailable, busyEnter,
     intakeFiles, uploadsPending, showToast, t,
   }
 
@@ -307,6 +307,12 @@ export const InputBar = memo(function InputBar({
       pasteText: (text) => {
         if (gate.current.machineBusy || gate.current.locked) return
         keyboard.paste(text)
+      },
+      page: (direction) => {
+        // An open completion menu keeps PageUp/PageDown for its own paging;
+        // a refused recall keeps the native editable scroll.
+        if (gate.current.machineBusy || gate.current.locked || gate.current.commandMenuOpen) return false
+        return keyboard.recall(direction)
       },
     })
   }, [editor, keyboard])

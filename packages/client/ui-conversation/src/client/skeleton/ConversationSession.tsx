@@ -1,6 +1,6 @@
 /** Strict per-session header/body content inserted into the resident conversation layout. */
 
-import { useEffect } from 'react'
+import { useEffect, useRef } from 'react'
 import clsx from 'clsx'
 import type { SessionListState, SessionSummary } from '@deepseek-ai/dsh-api-session-controller/client'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
@@ -167,7 +167,7 @@ export function ConversationSessionHeader({
  */
 export function ConversationSession({
   useSession, useConversation, useConversationViews, useInput, inputActions, useStore, actions,
-  renderSlot, bindDraftMirror, openView,
+  renderSlot, bindDraftMirror, bindHistory, openView,
 }: ConversationSessionProps) {
   const tabs = useConversationViews(value => value)
   const selectedId = useStore(s => s.view)
@@ -177,11 +177,23 @@ export function ConversationSession({
   const inputState = useInput(s => s)
   const storedDraft = useStore(s => s.draft)
   const viewRequest = useStore(s => s.viewRequest ?? null)
+  const history = useStore(s => s.history)
+  // The recall read face is a mount-time binding; the ref tracks the live
+  // list so the shell's per-gesture reads see the latest submissions.
+  const historyRef = useRef<readonly string[]>(history ?? [])
+  historyRef.current = history ?? []
 
   useEffect(() => {
     if (inputState.draft === '' && storedDraft !== '') inputActions.setDraft(storedDraft)
     const unmirror = bindDraftMirror(actions.setDraft)
-    return () => { unmirror() }
+    const unbindHistory = bindHistory(
+      () => historyRef.current,
+      (text) => { actions.pushHistory(text) },
+    )
+    return () => {
+      unmirror()
+      unbindHistory()
+    }
     // Mount-only (deps pinned to inputActions): later store writes come from
     // the machine mirror, not this seed effect.
   }, [inputActions])

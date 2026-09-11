@@ -76,6 +76,9 @@ export type PickOutcome =
 /** Keyboard keys intercepted by an open trigger menu. */
 export type ArbitrateKey = 'up' | 'down' | 'enter' | 'escape' | 'tab'
 
+/** Draft-recall walk direction: 'older' steps back, 'newer' steps forward. */
+export type DraftRecallDirection = 'older' | 'newer'
+
 /** Trigger-menu keyboard routing result. */
 export type ArbitrateOutcome = 'consumed' | 'pick-highlighted' | 'pass'
 
@@ -280,6 +283,13 @@ export interface ComposerKeyboard {
   arbitrate(key: ArbitrateKey, composing: boolean): ArbitrateOutcome
   /** Space adjudication; true = the input applied a claim — caller preventDefaults. */
   space(): boolean
+  /**
+   * PageUp/PageDown draft recall over the session's submitted drafts: the
+   * first 'older' step stashes the live draft, and the step past the newest
+   * entry restores it. Busy admission phases refuse.
+   * @returns whether the walk consumed the gesture (no default scroll).
+   */
+  recall(direction: DraftRecallDirection): boolean
   /** Dismiss the popupSelect shell (any interaction outside the box). */
   dismissPopup(): void
 }

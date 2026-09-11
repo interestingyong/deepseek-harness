@@ -22,7 +22,8 @@ import { createEmptyHistoryState, registerHistory } from '@lexical/history'
 import { mergeRegister } from '@lexical/utils'
 import type {
   ArbitrateKey, ArbitrateOutcome, CommandClaim, ConsumeTokenRequest, DraftAttachmentId,
-  InputActions, InputEffect, InputNotice, InputState, InputTriggerController, PickOutcome,
+  DraftRecallDirection, InputActions, InputEffect, InputNotice, InputState,
+  InputTriggerController, PickOutcome,
   Occurrence, QueuedMessage, ReferenceInsert, SessionInput, SubmitAttempt, SubmitAttachment,
   SubmitOutcome, TokenSpan,
 } from '../contract/input.ts'
@@ -154,6 +155,14 @@ export class SessionInputShell implements SessionInput {
   private disposed = false
   /** Draft persistence mirror (Conversation store write; receives the clipboard projection). */
   private mirrorFn: ((text: string) => void) | undefined
+  /** Submitted-draft recall read (Conversation store projection; consulted lazily per gesture). */
+  private historyRead: (() => readonly string[]) | undefined
+  /** Submitted-draft recall append (Conversation store write). */
+  private historyAppend: ((text: string) => void) | undefined
+  /** Recall walk cursor: index into the history list; null = at the live draft. */
+  private recallCursor: number | null = null
+  /** Live draft stashed when a recall walk began; restored at the newest end. */
+  private recallStash = ''
   /** Live lexicon subscription disposer; undefined until the controller resolves. */
   private lexiconOff: (() => void) | undefined
   /** Default sends retained until admission settles or scope disposal releases their attachments. */
@@ -356,7 +365,8 @@ export class SessionInputShell implements SessionInput {
    * Enter adjudication + submit transaction + default sink. Effects fan out
    * from the machine; this method only feeds the event. Lock entry
    * (adjudicating/submitting) force-closes the transient layers: the popup
-   * dismisses and the menu tracks frozen.
+   * dismisses and the menu tracks frozen. A non-blank submission joins the
+   * recall history and restarts the PgUp/PgDn walk.
    */
   submit(mode: InputSubmitMode = 'queue'): void {
     if (this.snapshot.draft.trim() === '' && this.attachmentIds.length > 0) {
@@ -388,6 +398,11 @@ export class SessionInputShell implements SessionInput {
     if (before.phase === 'claimed' && this.attachmentIds.length > 0 && before.claim?.attachments !== true) {
       this.notify('error', this.deps.commandAttachments.unsupportedNotice(before.claim?.token ?? before.draft))
       return
+    }
+    if (this.projection.clipboardText.trim() !== '') {
+      this.historyAppend?.(this.projection.clipboardText)
+      this.recallCursor = null
+      this.recallStash = ''
     }
     this.dispatchRun(({ type: 'enter', mode, draft: this.projection.clipboardText }))
     const phase = this.snapshot.phase
@@ -432,6 +447,43 @@ export class SessionInputShell implements SessionInput {
   /** Dismiss the popupSelect shell (any interaction outside the box). */
   dismissPopup(): void {
     this.deps.popup?.()?.dismiss()
+  }
+
+  /**
+   * PageUp/PageDown draft recall over the bound submission history (the
+   * ComposerKeyboard face method). The walk stashes the live draft on entry,
+   * steps one entry per gesture, pins at the oldest entry, and restores the
+   * stash on the step past the newest. Busy admission phases refuse (the
+   * editor is read-only there), as does every gesture without a bound
+   * history or at the live draft walking 'newer' — refused gestures keep
+   * the browser's native editable scroll.
+   * @param direction - 'older' steps back, 'newer' steps forward.
+   * @returns whether the walk consumed the gesture.
+   */
+  recall(direction: DraftRecallDirection): boolean {
+    const history = this.historyRead?.() ?? []
+    if (history.length === 0) return false
+    const phase = this.snapshot.phase
+    if (phase === 'adjudicating' || phase === 'submitting') return false
+    if (this.recallCursor === null) {
+      if (direction === 'newer') return false
+      this.recallStash = this.projection.clipboardText
+      this.recallCursor = history.length - 1
+    } else if (direction === 'older') {
+      if (this.recallCursor > 0) this.recallCursor -= 1
+    } else {
+      this.recallCursor += 1
+    }
+    let next: string
+    if (this.recallCursor >= history.length) {
+      next = this.recallStash
+      this.recallCursor = null
+      this.recallStash = ''
+    } else {
+      next = history[this.recallCursor] ?? ''
+    }
+    this.setDraft(next)
+    return true
   }
 
   /**
@@ -604,6 +656,23 @@ export class SessionInputShell implements SessionInput {
     this.mirrorFn = write
     return () => {
       if (this.mirrorFn === write) this.mirrorFn = undefined
+    }
+  }
+
+  /**
+   * Bind the submitted-draft recall faces (Conversation store read/append).
+   * Same package-private binding channel as {@link bindMirror}; the per-
+   * Session skeleton wires the store instance the shell cannot see.
+   * @param read - session history projection, oldest first.
+   * @param append - history write (dedup/limit live in the Conversation store).
+   * @returns the unbind disposer.
+   */
+  bindHistory(read: () => readonly string[], append: (text: string) => void): () => void {
+    this.historyRead = read
+    this.historyAppend = append
+    return () => {
+      if (this.historyRead === read) this.historyRead = undefined
+      if (this.historyAppend === append) this.historyAppend = undefined
     }
   }
 

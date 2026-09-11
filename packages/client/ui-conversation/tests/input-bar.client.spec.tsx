@@ -9,7 +9,7 @@
 // the shell (jsdom's beforeinput lacks the ranges Lexical needs).
 
 import type { GlobalStandardProps } from '@deepseek-ai/dsh-client-ui-slots'
-import { afterEach, describe, expect, it, onTestFinished, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 'vitest'
 import { act, cleanup, fireEvent, render } from '@testing-library/react'
 import { $getRoot, $isTextNode } from 'lexical'
 import {
@@ -17,6 +17,7 @@ import {
   sessionSnapshot as sessionFixture,
 } from '@deepseek-ai/dsh-client-test-runtime'
 import { createSnapshotStore } from '@deepseek-ai/dsh-client-store'
+import { createConversationStore } from '../src/client/stores.ts'
 import type { SessionListState, SessionSnapshot } from '@deepseek-ai/dsh-api-session-controller/client'
 import { zh as commonZh } from '@deepseek-ai/dsh-client-locale/src/locales/zh.ts'
 import type { Context } from '@deepseek-ai/cordis'
@@ -1688,5 +1689,96 @@ describe('command launcher chrome and control seats', () => {
     cleanup()
     const live = bench({ running: true, permissions })
     expect((live.view.getByLabelText(/^访问模式/) as HTMLButtonElement).disabled).toBe(false)
+  })
+})
+
+/** Bind a fresh per-Session Conversation store's history to a bench shell and return it. */
+function historyOf(shell: SessionInputShell) {
+  const store = createConversationStore().create(`recall-${Math.random()}`)
+  shell.bindHistory(
+    () => store.getSnapshot().history ?? [],
+    (text) => { store.actions.pushHistory(text) },
+  )
+  return store
+}
+
+/** Write a draft and submit it via Enter, settling the submit machine. */
+async function send(textarea: HTMLElement, text: string, shell: SessionInputShell): Promise<void> {
+  writeDraft(shell, text)
+  fireEvent.keyDown(textarea, { key: 'Enter', keyCode: 13 })
+  await act(async () => {})
+  await act(async () => {})
+}
+
+describe('PageUp/PageDown draft recall', () => {
+  beforeEach(() => { localStorage.clear() })
+
+  it('walks submitted drafts and restores the live draft past the newest entry', async () => {
+    const { textarea, shell } = bench()
+    historyOf(shell)
+    await send(textarea, 'older one', shell)
+    await send(textarea, 'two', shell)
+
+    fireEvent.keyDown(textarea, { key: 'PageUp' })
+    expect(shell.snapshot.draft).toBe('two')
+    fireEvent.keyDown(textarea, { key: 'PageUp' })
+    expect(shell.snapshot.draft).toBe('older one')
+    fireEvent.keyDown(textarea, { key: 'PageUp' }) // pinned at the oldest
+    expect(shell.snapshot.draft).toBe('older one')
+    fireEvent.keyDown(textarea, { key: 'PageDown' })
+    expect(shell.snapshot.draft).toBe('two')
+    fireEvent.keyDown(textarea, { key: 'PageDown' }) // past newest restores the live (empty) draft
+    expect(shell.snapshot.draft).toBe('')
+  })
+
+  it('falls through without a history and while the completion menu is open', async () => {
+    const empty = bench()
+    const noHistory = fireEvent.keyDown(empty.textarea, { key: 'PageUp' })
+    expect(noHistory).toBe(true) // refused: the native editable scroll owns it
+
+    const open = bench({ commandMenuOpen: true })
+    historyOf(open.shell)
+    await send(open.textarea, 'sent', open.shell)
+    writeDraft(open.shell, 'live')
+    const menuOpen = fireEvent.keyDown(open.textarea, { key: 'PageUp' })
+    expect(menuOpen).toBe(true) // the menu keeps PageUp for its own paging
+    expect(open.shell.snapshot.draft).toBe('live')
+  })
+
+  it('a submission during a walk restarts the walk from the tail', async () => {
+    const { textarea, shell } = bench()
+    historyOf(shell)
+    await send(textarea, 'older one', shell)
+    await send(textarea, 'two', shell)
+
+    fireEvent.keyDown(textarea, { key: 'PageUp' })
+    expect(shell.snapshot.draft).toBe('two')
+    fireEvent.keyDown(textarea, { key: 'Enter', keyCode: 13 })
+    await act(async () => {})
+    await act(async () => {})
+    expect(shell.snapshot.draft).toBe('')
+    fireEvent.keyDown(textarea, { key: 'PageUp' })
+    expect(shell.snapshot.draft).toBe('two')
+    fireEvent.keyDown(textarea, { key: 'PageUp' })
+    expect(shell.snapshot.draft).toBe('older one')
+  })
+
+  it('Arrow Up/Down walk history at the top/bottom line (Codex-style)', async () => {
+    const { textarea, shell } = bench()
+    historyOf(shell)
+    await send(textarea, 'test', shell)
+    await send(textarea, 'test2', shell)
+    expect(shell.snapshot.draft).toBe('')
+
+    fireEvent.keyDown(textarea, { key: 'ArrowUp' })
+    expect(shell.snapshot.draft).toBe('test2')
+    fireEvent.keyDown(textarea, { key: 'ArrowUp' })
+    expect(shell.snapshot.draft).toBe('test')
+    fireEvent.keyDown(textarea, { key: 'ArrowUp' }) // pinned at the oldest
+    expect(shell.snapshot.draft).toBe('test')
+    fireEvent.keyDown(textarea, { key: 'ArrowDown' })
+    expect(shell.snapshot.draft).toBe('test2')
+    fireEvent.keyDown(textarea, { key: 'ArrowDown' })
+    expect(shell.snapshot.draft).toBe('') // the pre-walk empty draft returns
   })
 })

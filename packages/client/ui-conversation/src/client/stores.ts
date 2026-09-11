@@ -5,9 +5,13 @@ import type { ConversationStoreState } from './contract/views.ts'
 
 const CONVERSATION_STORE_KEY = 'dsh.conversation'
 
+/** Recall list depth: PgUp/PgDn walks stay within the recent submission tail. */
+const HISTORY_LIMIT = 200
+
 /** Declared write set for the Conversation shell. */
 type ConversationActions = {
   setDraft: (draft: ConversationStoreState, text: string) => void
+  pushHistory: (draft: ConversationStoreState, text: string) => void
   setView: (draft: ConversationStoreState, view: string) => void
   openView: (draft: ConversationStoreState, view: string, focus: string) => void
   completeViewRequest: (draft: ConversationStoreState) => void
@@ -19,10 +23,18 @@ type ConversationActions = {
  */
 export function createConversationStore(): EngineStoreHandle<ConversationStoreState, ConversationActions> {
   return defineStore({
-    init: (): ConversationStoreState => ({ draft: '', view: null, viewRequest: null }),
+    init: (): ConversationStoreState => ({ draft: '', view: null, viewRequest: null, history: [] }),
     persist: CONVERSATION_STORE_KEY,
     actions: {
       setDraft: (d, text: string) => { d.draft = text },
+      pushHistory: (d, text: string) => {
+        const history = d.history ??= []
+        // Consecutive duplicates collapse: re-sending an unchanged draft is
+        // one recall stop, as in shell history.
+        if (history.at(-1) === text) return
+        history.push(text)
+        if (history.length > HISTORY_LIMIT) history.splice(0, history.length - HISTORY_LIMIT)
+      },
       setView: (d, view: string) => { d.view = view },
       openView: (d, view: string, focus: string) => {
         d.view = view

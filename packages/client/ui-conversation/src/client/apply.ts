@@ -266,6 +266,7 @@ export function apply(ctx: Context, config: Config = Config({})): void {
     inject: (sessionId: SessionId, actions: BoundActions<typeof conversationStore>): ConversationSessionInjected => ({
       hooks: { conversationViews },
       bindDraftMirror: write => inputHub.shell(sessionId).bindMirror(write),
+      bindHistory: (read, append) => inputHub.shell(sessionId).bindHistory(read, append),
       openView: (view, focus) => {
         activateView(sessionId, view)
         actions.openView(view, focus)

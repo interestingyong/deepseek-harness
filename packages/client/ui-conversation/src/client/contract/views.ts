@@ -18,6 +18,12 @@ export interface ConversationViewRequest {
 export interface ConversationStoreState {
   /** Composer draft (persisted; survives session switches and reloads). */
   draft: string
+  /**
+   * Submitted composer drafts, oldest first (PgUp/PgDn recall walks the
+   * tail). Optional: persisted blobs written before the key existed
+   * rehydrate without it (persistence wholesale-replaces the state).
+   */
+  history?: string[] | undefined
   /** Preferred `conversation.view` entry id; null resolves to Chat when registered. */
   view: string | null
   /** Focus request consumed and acknowledged by the addressed View. */
