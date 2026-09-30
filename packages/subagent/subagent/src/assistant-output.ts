@@ -1,11 +1,14 @@
 /**
  * Canonical selection of a child's final assistant output. Backend run results
- * and `subagent/end.lastAssistantMessage` apply the same rule: select the last
- * non-empty assistant message. An empty-content message records usage only
- * when the loop appends it after a max-tokens step with no executable blocks,
- * so it does not replace earlier output. If no non-empty message exists,
- * select the accumulated assistant text. Selection is independent of the
- * run's stop reason.
+ * and `subagent/end.lastAssistantMessage` apply the same rule: prefer the last
+ * assistant message carrying visible prose (a non-blank `text` block); a
+ * textless but non-empty message (reasoning- or tool-call-only) remains the
+ * candidate only when no textful message exists, so a final bare tool call no
+ * longer blanks an answer the child spoke one message earlier. An
+ * empty-content message records usage only when the loop appends it after a
+ * max-tokens step with no executable blocks, so it does not replace earlier
+ * output. If no non-empty message exists at all, select the accumulated
+ * assistant text. Selection is independent of the run's stop reason.
  *
  * @module @deepseek-ai/dsh-subagent/assistant-output
  */
@@ -20,19 +23,37 @@ import type { SessionEvent } from '@deepseek-ai/dsh-session'
  * text into the same streamed fallback.
  */
 export class AssistantOutputFold {
-  private message: ContentBlock[] | undefined
+  /**
+   * Last assistant message carrying visible prose (a non-blank `text` block).
+   * Preferred over {@link messageAny}: a trailing tool-call-only message
+   * (a bare `send_message`-style invocation) must not blank the answer the
+   * child spoke one message earlier — settlement renders prose, not tool
+   * calls, so the tool-only choice surfaces as an empty closing message.
+   */
+  private messageTextful: ContentBlock[] | undefined
+  /**
+   * Last non-empty assistant message whatever its blocks. Fallback for runs
+   * whose only output is textless content (reasoning- or tool-call-only), so
+   * their final message still reports instead of dropping to stream text.
+   */
+  private messageAny: ContentBlock[] | undefined
   private partial: string[] = []
 
   /**
    * Fold one session event: a non-empty assistant message becomes the
-   * candidate final answer, while its embedded stream and any log-only attempt
-   * extend the streamed fallback; every other event contributes nothing.
+   * candidate final answer — the newest one with visible prose always wins,
+   * the newest non-empty one otherwise — while its embedded stream and any
+   * log-only attempt extend the streamed fallback; every other event
+   * contributes nothing.
    * @param event - the next observed session event.
    */
   push(event: SessionEvent): void {
     if (event.type === 'assistant/message') {
       const content = event.data.message.content
-      if (content.length > 0) this.message = content
+      if (content.length > 0) {
+        this.messageAny = content
+        if (content.some(hasVisibleText)) this.messageTextful = content
+      }
     }
     if (event.type === 'assistant/message' || event.type === 'assistant/attempt') {
       this.pushText(joinAssistantStreamText(event.data.stream))
@@ -49,14 +70,26 @@ export class AssistantOutputFold {
 
   /**
    * Select the final output folded so far.
-   * @returns the last non-empty assistant message, else the accumulated
-   *   streamed text, or `undefined` when the child produced neither.
+   * @returns the last assistant message carrying visible prose, else the last
+   *   non-empty message, else the accumulated streamed text, or `undefined`
+   *   when the child produced none of the three.
    */
   collect(): ContentBlock[] | undefined {
-    if (this.message !== undefined) return this.message
+    if (this.messageTextful !== undefined) return this.messageTextful
+    if (this.messageAny !== undefined) return this.messageAny
     const text = this.partial.join('')
     return text.length > 0 ? [{ type: 'text', text }] : undefined
   }
+}
+
+/**
+ * True when one block renders as readable closing prose: a `text` block with
+ * non-blank content. Reasoning blocks are model thinking rather than spoken
+ * output, and tool calls carry no displayable prose, so neither qualifies.
+ * @param block - the content block to test.
+ */
+function hasVisibleText(block: ContentBlock): boolean {
+  return block.type === 'text' && block.text.trim().length > 0
 }
 
 /**

@@ -81,6 +81,31 @@ describe('finalAssistantOutput', () => {
     expect(finalAssistantOutput([])).toBeUndefined()
     expect(finalAssistantOutput([reasoningDelta('thinking'), message([])])).toBeUndefined()
   })
+
+  it('prefers the last message with visible prose over a trailing tool-call-only message', () => {
+    const events = [
+      message([{ type: 'text', text: 'spoken report' }]),
+      message([
+        { type: 'tool-call', id: 'call-1', name: 'send_message', arguments: '{"text":"spoken report"}' } as unknown as ContentBlock,
+      ]),
+    ]
+    expect(finalAssistantOutput(events)).toEqual([{ type: 'text', text: 'spoken report' }])
+  })
+
+  it('keeps a trailing tool-call-only message when no textful message exists', () => {
+    const toolCall = {
+      type: 'tool-call', id: 'call-1', name: 'send_message', arguments: '{}',
+    } as unknown as ContentBlock
+    expect(finalAssistantOutput([message([toolCall])])).toEqual([toolCall])
+  })
+
+  it('ignores whitespace-only text when selecting the spoken message', () => {
+    const events = [
+      message([{ type: 'text', text: 'solid answer' }]),
+      message([{ type: 'text', text: '   ' }]),
+    ]
+    expect(finalAssistantOutput(events)).toEqual([{ type: 'text', text: 'solid answer' }])
+  })
 })
 
 describe('AssistantOutputFold', () => {
