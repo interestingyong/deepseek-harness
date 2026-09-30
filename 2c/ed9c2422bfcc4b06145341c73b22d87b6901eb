@@ -1,0 +1,16 @@
+packages/subagent/subagent/src/assistant-output.ts
+  h_c7c52bcf9e03a5 3-11,26-39,44-47,53-56,73-75,78-79,85-94
+packages/subagent/subagent/tests/assistant-output.spec.ts
+  h_c7c52bcf9e03a5 84-108
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "2ced9c2422bfcc4b06145341c73b22d87b6901eb",
+  "prompts": {},
+  "humans": {
+    "h_c7c52bcf9e03a5": {
+      "author": "wangyong27 <wangyong27@lenovo.com>"
+    }
+  }
+}
