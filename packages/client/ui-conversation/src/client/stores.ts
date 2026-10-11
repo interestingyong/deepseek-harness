@@ -13,6 +13,8 @@ type ConversationActions = {
   setView: (draft: ConversationStoreState, view: string) => void
   openView: (draft: ConversationStoreState, view: string, focus: string) => void
   completeViewRequest: (draft: ConversationStoreState) => void
+  /** Record a non-blank, deduplicated submission into the recall history. */
+  pushHistory: (draft: ConversationStoreState, text: string) => void
 }
 
 /**
@@ -21,7 +23,7 @@ type ConversationActions = {
  */
 export function createConversationStore(): EngineStoreHandle<ConversationStoreState, ConversationActions> {
   return defineStore({
-    init: (): ConversationStoreState => ({ draft: '', view: null, viewRequest: null }),
+    init: (): ConversationStoreState => ({ draft: '', view: null, viewRequest: null, history: [] }),
     persist: CONVERSATION_STORE_KEY,
     actions: {
       setDraft: (d, text: DraftInput) => { d.draft = text },
@@ -31,6 +33,13 @@ export function createConversationStore(): EngineStoreHandle<ConversationStoreSt
         d.viewRequest = { view, focus }
       },
       completeViewRequest: (d) => { d.viewRequest = null },
+      pushHistory: (d, text: string) => {
+        const trimmed = text.trim()
+        if (trimmed === '') return
+        const last = d.history[d.history.length - 1]
+        if (last === trimmed) return
+        d.history = [...d.history, trimmed].slice(-200)
+      },
     },
   })
 }

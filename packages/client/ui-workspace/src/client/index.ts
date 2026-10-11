@@ -122,8 +122,8 @@ export function apply(ctx: Context): void {
   ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'ui-workspace: dictionaries')
   const shortcutControls = createWorkspaceShortcutControls()
 
-  const searchSessions: WorkspaceBrowserInjected['searchSessions'] = async (query, signal) => {
-    const result = await sessions.search(query, signal)
+  const searchSessions: WorkspaceBrowserInjected['searchSessions'] = async (query, signal, options) => {
+    const result = await sessions.search(query, signal, options?.scope === undefined ? undefined : { scope: options.scope })
     if (!result.ok) throw new Error(result.error.message)
     return result.value
   }

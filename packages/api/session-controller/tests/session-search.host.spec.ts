@@ -23,8 +23,8 @@ import { ApiSessionList } from '../src/list.ts'
 const sid = (value: string): SessionId => value as SessionId
 const defaults = { defaultModelSelection: () => ({ provider: 'p', model: 'm' }), cwd: '/tmp' }
 
-function request(query: string): { query: string } {
-  return { query }
+function request(query: string, scope?: 'current' | 'all'): { query: string; scope?: 'current' | 'all' } {
+  return { query, ...scope === undefined ? {} : { scope } }
 }
 
 function header(id: string, cwd: string | null = '/project'): SessionHeader {
@@ -98,7 +98,7 @@ describe('session.search', () => {
     const ctx = await baseContext()
     const list = new ApiSessionList(ctx, 8)
 
-    await expect(list.search('query', new AbortController().signal)).rejects.toMatchObject({
+    await expect(list.search({ query: 'query' }, new AbortController().signal)).rejects.toMatchObject({
       code: 'gateway/internal',
     })
     await ctx.fiber.dispose()
@@ -247,6 +247,47 @@ describe('session.search', () => {
         hasMore: false,
       },
     })
+  })
+
+  it('matches shadowed messages only when the request scopes in all history', async () => {
+    const ctx = await baseContext()
+    const visible = hit('visible')
+    ctx.sessions.create(visible.header.id, { meta: visible.header })
+    const shadowed: SessionSearchHit = {
+      ...hit('visible', 1),
+      bestMatch: {
+        ...hit('visible', 1).bestMatch,
+        surface: 'shadowed',
+        snippet: 'compacted-away mention',
+      },
+    }
+    const searchSessions = vi.fn((_request: SessionSearchRequest) => Promise.resolve({ items: [shadowed] }))
+    installSearchQuery(ctx, searchSessions)
+    const remote = createSessionTestRemote(ctx, defaults)
+
+    await expect(remote.search(request('mention'), new AbortController().signal))
+      .resolves.toEqual({ ok: true, value: { items: [], hasMore: false } })
+    await expect(remote.search(request('mention', 'current'), new AbortController().signal))
+      .resolves.toEqual({ ok: true, value: { items: [], hasMore: false } })
+    await expect(remote.search(request('mention', 'all'), new AbortController().signal))
+      .resolves.toEqual({
+        ok: true,
+        value: {
+          items: [{ sessionId: 'visible', snippet: 'compacted-away mention' }],
+          hasMore: false,
+        },
+      })
+
+    const filters = searchSessions.mock.calls.map(([providerRequest]) => providerRequest.eventFilters)
+    const currentSurface = [
+      { kind: 'type', values: ['user/message', 'assistant/message'] },
+      { kind: 'surface', values: ['current'] },
+    ]
+    expect(filters[0]).toEqual(currentSurface)
+    expect(filters[1]).toEqual(currentSurface)
+    expect(filters[2]).toEqual([
+      { kind: 'type', values: ['user/message', 'assistant/message'] },
+    ])
   })
 
   it('pages the globally ranked stream until the 20-item Host boundary is known', async () => {

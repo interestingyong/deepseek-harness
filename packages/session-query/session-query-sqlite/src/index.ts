@@ -1,51 +1,43 @@
 /**
  * Concrete session-query service with SQLite FTS5 over the live-preferred corpus.
  *
+ * The search backend runs on a **dedicated Worker thread**: all CPU-heavy work
+ * (session fingerprinting, search-document extraction) and all synchronous
+ * `node:sqlite` calls (FTS5 writes and queries) execute there, so the host
+ * event loop never stalls during first-search indexing or content search.
+ * The host drives async persistence I/O and live-session snapshotting,
+ * performs request validation and normalization, streams loaded sessions to
+ * the worker for indexing, and assembles result pages from worker rows.
+ *
  * @module @deepseek-ai/dsh-session-query-sqlite
  */
 
-import { createHash, randomUUID } from 'node:crypto'
-import { SESSION_FORMAT_VERSION, SessionSeq } from '@deepseek-ai/dsh-session'
-import type { DatabaseSync } from 'node:sqlite'
+import { tmpdir } from 'node:os'
+import { Worker } from 'node:worker_threads'
+import { fileURLToPath } from 'node:url'
 import { Context, Service, type Fiber } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import type { Session, SessionEvent, SessionHeader, SessionId, SessionLogOffset } from '@deepseek-ai/dsh-session'
 import type SessionPersistence from '@deepseek-ai/dsh-session-persistence'
-import type {
-  SessionPersistenceRevision,
-  SessionPersistenceSnapshot,
-} from '@deepseek-ai/dsh-session-persistence'
+import type { SessionPersistenceRevision } from '@deepseek-ai/dsh-session-persistence'
 import SessionQueryEngine, {
-  SESSION_QUERY_DEFAULT_PERSISTED_INSPECT_CONCURRENCY,
-  SESSION_QUERY_DEFAULT_PREPARED_SESSION_CACHE_SIZE,
-  SESSION_QUERY_READ_WINDOW_MAX,
   SessionQueryError,
   SessionSearchCursor,
   assertSessionHeadersCompatible,
-  buildSessionEventSearchDocuments,
   readColdSessionLog,
 } from '@deepseek-ai/dsh-session-query'
 import type {
   Config as SessionQueryConfig,
-  SessionEventSearchDocument,
   SessionEventSearchHit,
   SessionEventSearchPage,
   SessionEventSearchRequest,
   SessionSearchExecContext,
   SessionSearchHit,
-  SessionSearchCursor as SessionSearchCursorValue,
   SessionSearchPage,
   SessionSearchRequest,
 } from '@deepseek-ai/dsh-session-query'
+import { type JournalMode } from './schema.ts'
 import {
-  type JournalMode,
-  openSearchDatabase,
-} from './schema.ts'
-import {
-  type NormalizedEventRequest,
-  type NormalizedSessionRequest,
-  FTS_HIGHLIGHT_END,
-  FTS_HIGHLIGHT_START,
   assertFts5OuterPredicateCount,
   assertPortableBindingCount,
   buildEventWhere,
@@ -53,20 +45,20 @@ import {
   makeSnippet,
   normalizeEventRequest,
   normalizeSessionRequest,
-  quoteFtsData,
   requestFingerprint,
-  sanitizeFtsText,
-  SQLITE_MAX_PAGE_LIMIT,
 } from './query.ts'
+import type {
+  LoadedSession,
+  MainToWorkerMessage,
+  SearchRow,
+  WorkerToMainMessage,
+} from './protocol.ts'
 
 export {
   SESSION_QUERY_SQLITE_APPLICATION_ID,
   SESSION_QUERY_SQLITE_SCHEMA_VERSION,
   type JournalMode,
 } from './schema.ts'
-
-/** Boot-context slot for a launcher-owned absolute path to this process's derived query index. */
-export const SESSION_QUERY_SQLITE_PATH_KEY = 'launcherSessionQueryPath'
 
 declare module '@deepseek-ai/cordis' {
   interface Context {
@@ -79,11 +71,8 @@ declare module '@deepseek-ai/cordis' {
 export const SESSION_QUERY_SQLITE_DEFAULT_LIMIT = 20
 /** Maximum accepted result page size. */
 export const SESSION_QUERY_SQLITE_MAX_LIMIT = 100
-/** Default maximum snippet length in Unicode code points. */
+/** Maximum snippet length in Unicode code points. */
 export const SESSION_QUERY_SQLITE_SNIPPET_CHARS = 240
-
-// One transient source change gets a retry; repeated churn fails rather than monopolizing the queue.
-const STABLE_OBSERVATION_ATTEMPTS = 2
 
 /** SQLite module/handle opening phase; `never` disables full-text search entirely. */
 export type OpenAt = 'startup' | 'first-search' | 'never'
@@ -97,11 +86,10 @@ export interface Config extends SessionQueryConfig {
    */
   path: string
   /**
-   * Open the SQLite module and handle at service activation or the first
-   * search, or `never` to disable full-text search: the inherited exact
-   * reads, filters, and traces stay available, while `searchSessions` and
-   * `searchEvents` fail with `SESSION_QUERY_SEARCH_DISABLED` and SQLite is
-   * never imported or opened. Defaults to `startup`.
+   * Open the SQLite module and handle at service activation or the first search,
+   * or `never` to disable full-text search: the inherited exact reads, filters,
+   * and traces stay available, while `searchSessions` and `searchEvents` fail
+   * with `SESSION_QUERY_SEARCH_DISABLED` and SQLite is never imported or opened.
    */
   openAt?: OpenAt
   /** SQLite journal mode. Defaults to `wal`. */
@@ -130,17 +118,10 @@ interface ResolvedConfig {
   preparedSessionCacheSize: number
 }
 
-interface ObservedSession {
-  header: SessionHeader
-  inheritedEventCount: SessionLogOffset
-  documents: SessionEventSearchDocument[]
-  fingerprint: string
-}
-
-interface ObservedPersistedSession {
-  header: SessionHeader
-  revision: SessionPersistenceRevision
-  loaded?: ObservedSession
+interface IndexedSessionRecord {
+  readonly sessionId: SessionId
+  readonly revision: string
+  readonly source: 'persisted' | 'live'
 }
 
 interface PersistenceBinding {
@@ -148,55 +129,35 @@ interface PersistenceBinding {
   readonly service?: SessionPersistence
 }
 
-interface Observation {
-  persistenceBinding: PersistenceBinding
-  persisted: Map<SessionId, ObservedPersistedSession>
-  live: Map<SessionId, ObservedSession>
+interface ObservedPersistedSession {
+  header: SessionHeader
+  revision: SessionPersistenceRevision
+  loaded?: {
+    header: SessionHeader
+    inheritedEventCount: SessionLogOffset
+    events: SessionEvent[]
+  }
 }
 
-interface IndexedPersistedRow {
-  id: string
-  revision: string
-  generation: number
-}
-
-interface IndexedLiveRow {
-  id: string
-  fingerprint: string
-  persisted: number
-  generation: number
-}
-
-interface SessionHeaderRow {
-  session_id: string
-  version: number
-  created_at: number
-  cwd: string | null
-  parent_session: string | null
-  seed_length: number | null
-  delegation_depth: number | null
-  agent_preset: string | null
-}
-
-interface SearchRow extends SessionHeaderRow {
-  live: number
-  persisted: number
-  seq: number
-  type: string
-  time: number
-  surface: string
-  marked_text: string
-  match_count: number
-  document_length: number
-}
-
-interface CursorPayload {
-  version: 1
-  instance: string
-  scope: 'sessions' | 'events'
-  fingerprint: string
-  generation: string
-  offset: number
+interface WorkerQueryPayload {
+  readonly queryId: number
+  readonly scope: 'sessions' | 'events'
+  /** LIMIT + 1 rows the worker should fetch. */
+  readonly limit: number
+  /** OFFSET within the matched result set. */
+  readonly offset: number
+  /** Whether persisted sources contribute rows. */
+  readonly persistenceVisible: boolean
+  /** Fingerprint of the normalized request; cursor validation. */
+  readonly fingerprint: string
+  /** Generation tag at the time of query; cursor validation. */
+  readonly generation: string
+  /** WHERE fragment built on host from normalized filters. */
+  readonly whereSql: string
+  /** Bindings for ...session/event filters and ?session_id. */
+  readonly bindings: readonly (string | number)[]
+  /** Target session id for event-level queries, else undefined. */
+  readonly sessionId?: SessionId
 }
 
 /** Concrete SQLite owner of the combined `ctx.sessionQuery` service. */
@@ -207,41 +168,30 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
     path: z.string().required(),
     openAt: z.union(['startup', 'first-search', 'never'] as const).default('startup'),
     journalMode: z.union(['wal', 'delete', 'truncate', 'persist'] as const).default('wal'),
-    defaultLimit: z.number().step(1).min(1).max(SQLITE_MAX_PAGE_LIMIT).default(SESSION_QUERY_SQLITE_DEFAULT_LIMIT),
-    maxLimit: z.number().step(1).min(1).max(SQLITE_MAX_PAGE_LIMIT).default(SESSION_QUERY_SQLITE_MAX_LIMIT),
+    defaultLimit: z.number().step(1).min(1).max(Number.MAX_SAFE_INTEGER - 1).default(SESSION_QUERY_SQLITE_DEFAULT_LIMIT),
+    maxLimit: z.number().step(1).min(1).max(Number.MAX_SAFE_INTEGER - 1).default(SESSION_QUERY_SQLITE_MAX_LIMIT),
     snippetChars: z.number().step(1).min(1).default(SESSION_QUERY_SQLITE_SNIPPET_CHARS),
-    readWindowMax: z.number().step(1).min(0).default(SESSION_QUERY_READ_WINDOW_MAX),
-    persistedReadConcurrency: z.number()
-      .step(1)
-      .min(1)
-      .max(Number.MAX_SAFE_INTEGER)
-      .default(SESSION_QUERY_DEFAULT_PERSISTED_INSPECT_CONCURRENCY),
-    preparedSessionCacheSize: z.number()
-      .step(1)
-      .min(1)
-      .max(Number.MAX_SAFE_INTEGER)
-      .default(SESSION_QUERY_DEFAULT_PREPARED_SESSION_CACHE_SIZE),
+    readWindowMax: z.number().step(1).min(0).default(50),
+    persistedReadConcurrency: z.number().step(1).min(1).max(Number.MAX_SAFE_INTEGER).default(4),
+    preparedSessionCacheSize: z.number().step(1).min(1).max(Number.MAX_SAFE_INTEGER).default(5),
   })
 
-  /** Validated and defaulted backend configuration. */
   readonly config: ResolvedConfig
 
-  private readonly _instance = randomUUID()
+  /** Most-recent successful worker search response generation. */
+  private _responseGeneration: number | undefined
+  private _worker: Worker | undefined
   private _ready: Promise<void> | undefined
-  private _db: DatabaseSync | undefined
+  private _closed = false
+  private _pendingQueryId = 0
+  private _queryResolvers = new Map<number, { resolve: (rows: SearchRow[]) => void; reject: (error: Error) => void }>()
+  private _indexedById = new Map<SessionId, IndexedSessionRecord>()
   private _persistenceBinding: PersistenceBinding = { identity: Symbol() }
   private _lastPersistenceIdentity: symbol | undefined
-  private _persistenceEpoch = 0
-  private _globalGeneration = 0
-  private _localGeneration = 0
   private _tail: Promise<void> = Promise.resolve()
-  private _closed = false
-  private _closePromise: Promise<void> | undefined
   private readonly _optionalPersistenceFiber: Fiber
 
   constructor(ctx: Context, config: Config) {
-    // The assignment expression resolves before the base constructor can
-    // register `ctx.sessionQuery`; keep that same validated value afterward.
     super(ctx, config = resolveConfig(config))
     this.config = config as ResolvedConfig
     this._optionalPersistenceFiber = ctx.inject(['sessionPersistence'], (childCtx: Context) => {
@@ -249,7 +199,6 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
       const binding = { identity: Symbol(), service }
       this._persistenceBinding = binding
       childCtx.effect(() => () => {
-        /* v8 ignore next -- a stale optional-service disposer cannot clear a replacement */
         if (this._persistenceBinding !== binding) return
         this._persistenceBinding = { identity: Symbol() }
       }, 'sessionQuerySqlite.persistenceBinding')
@@ -257,10 +206,9 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
     ctx.effect(() => {
       return () => this._optionalPersistenceFiber.dispose()
     }, 'sessionQuerySqlite.optionalPersistence')
-    ctx.effect(() => async () => this.close(), 'sessionQuerySqlite.close')
+    ctx.effect(() => () => this.close(), 'sessionQuerySqlite.close')
   }
 
-  /** Open eagerly only when activation owns the configured readiness boundary. */
   protected async [Service.init](): Promise<void> {
     if (this.config.openAt === 'startup') await this._ensureReady(undefined)
   }
@@ -271,25 +219,39 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
   ): Promise<SessionSearchPage<SessionSearchHit>> {
     this._assertSearchEnabled()
     const normalized = normalizeSessionRequest(request, this.config)
+
+    // Validate filters synchronously on the host so client errors reject the
+    // call immediately, before any network/thread round-trip.
+    const sessionWhere = buildSessionWhere(normalized.sessionFilters)
+    const eventWhere = buildEventWhere(normalized.eventFilters)
+    assertFts5OuterPredicateCount(sessionWhere.predicateCount + eventWhere.predicateCount)
+    const whereSql = [sessionWhere.sql, eventWhere.sql].filter(Boolean).join(' AND ')
+    const bindings = [...sessionWhere.params, ...eventWhere.params]
+    assertPortableBindingCount(bindings.length)
+
     const signal = exec?.signal
+    const fingerprint = requestFingerprint(normalized)
     return this._serialized(signal, async () => {
       await this._ensureReady(signal)
-      const persistenceBinding = await this._reconcile(signal)
-      assertNotAborted(signal)
-      const generation = String(this._globalGeneration)
-      const fingerprint = requestFingerprint(normalized)
+      await this._reconcileIndex(signal)
+      // Validate the cursor eagerly so stale/invalid cursors reject fast.
+      const generation = String(this._responseGeneration ?? 0)
       const offset = normalized.cursor === undefined
         ? 0
-        : decodeCursor(normalized.cursor, this._instance, 'sessions', fingerprint, generation)
-      const rows = this._querySessions(normalized, offset, persistenceBinding)
-      return page(rows, normalized.limit, row => this._sessionHit(row), cursorOffset => encodeCursor({
-        version: 1,
-        instance: this._instance,
+        : this._decodeCursor(normalized.cursor, 'sessions', fingerprint, generation)
+      const payload: WorkerQueryPayload = {
+        queryId: this._nextQueryId(),
         scope: 'sessions',
+        limit: normalized.limit,
+        offset,
+        persistenceVisible: this._persistenceBinding.service !== undefined,
         fingerprint,
         generation,
-        offset: cursorOffset,
-      }), offset)
+        whereSql,
+        bindings,
+      }
+      const rows = await this._sendQuery(payload)
+      return this._pageFromRows(rows, normalized.limit, offset, payload)
     })
   }
 
@@ -299,42 +261,44 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
   ): Promise<SessionEventSearchPage> {
     this._assertSearchEnabled()
     const normalized = normalizeEventRequest(request, this.config)
+    const eventWhere = buildEventWhere(normalized.filters)
+    assertFts5OuterPredicateCount(1 + eventWhere.predicateCount)
+    const bindings = [...eventWhere.params]
+    assertPortableBindingCount(bindings.length)
     const signal = exec?.signal
+    const fingerprint = requestFingerprint(normalized)
     return this._serialized(signal, async () => {
       await this._ensureReady(signal)
-      const persistenceBinding = await this._reconcile(signal)
-      assertNotAborted(signal)
-      const target = this._targetObservation(normalized.sessionId, persistenceBinding)
-      const fingerprint = requestFingerprint(normalized)
-      const offset = normalized.cursor === undefined
-        ? 0
-        : decodeCursor(normalized.cursor, this._instance, 'events', fingerprint, target.generation)
-      const rows = this._queryEvents(normalized, offset, persistenceBinding)
+      const generation = String(this._responseGeneration ?? 0)
+      const offset = normalized.cursor === undefined ? 0 : this._decodeCursor(normalized.cursor, 'events', fingerprint, generation)
+      const payload: WorkerQueryPayload = {
+        queryId: this._nextQueryId(),
+        scope: 'events',
+        limit: normalized.limit,
+        offset,
+        persistenceVisible: true,
+        fingerprint,
+        generation,
+        whereSql: eventWhere.sql,
+        bindings,
+        sessionId: request.sessionId,
+      }
+      const rows = await this._sendQuery(payload)
+      const header = await this._resolveHeader(request.sessionId)
       return {
-        session: target.header,
-        ...page(rows, normalized.limit, row => this._eventHit(row), cursorOffset => encodeCursor({
-          version: 1,
-          instance: this._instance,
-          scope: 'events',
-          fingerprint,
-          generation: target.generation,
-          offset: cursorOffset,
-        }), offset),
+        session: header,
+        ...this._eventPageFromRows(rows, normalized.limit, offset, payload),
       }
     })
   }
 
-  /** Close the database after every accepted operation reaches quiescence. */
-  close(): Promise<void> {
-    this._closePromise ??= this._close()
-    return this._closePromise
+  close(): void {
+    this._closed = true
+    this._worker?.postMessage({ type: 'dispose' } satisfies MainToWorkerMessage)
+    this._worker?.terminate()
+    this._worker = undefined
   }
 
-  /**
-   * Refuse full-text calls under `openAt: 'never'` before any request
-   * normalization or SQLite work, so a disabled deployment never imports
-   * node:sqlite, opens the index, or observes sources.
-   */
   private _assertSearchEnabled(): void {
     if (this.config.openAt !== 'never') return
     throw new SessionQueryError(
@@ -343,402 +307,322 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
     )
   }
 
-  private async _close(): Promise<void> {
-    this._closed = true
-    await this._tail
-    if (this._ready !== undefined) {
-      try {
-        await this._ready
-      } catch {
-        // Opening already closed a partially-created handle; disposal only waits.
-      }
-    }
-    this._db?.close()
-    this._db = undefined
-  }
-
-  private async _open(): Promise<void> {
-    this._db = await openSearchDatabase(this.config.path, this.config.journalMode)
-    const state = this._db.prepare(
-      'SELECT global_generation FROM search_state WHERE singleton = 1',
-    ).get() as { global_generation: number }
-    this._globalGeneration = state.global_generation
-    this._localGeneration = state.global_generation
-  }
-
   private async _ensureReady(signal: AbortSignal | undefined): Promise<void> {
-    this._ready ??= this._open()
+    this._ready ??= this._spawnWorker()
     try {
       await waitWithAbort(this._ready, signal)
     } catch (error: unknown) {
-      if (isAbort(error)) throw error
+      if (isAbortError(error)) throw error
       throw new SessionQueryError(
-        `session-search SQLite index failed to open: ${errorMessage(error)}`,
+        `session-search worker failed to start: ${errorMessage(error)}`,
         'SESSION_QUERY_INDEX_FAILED',
         { cause: error },
       )
     }
   }
 
-  private async _serialized<T>(signal: AbortSignal | undefined, operation: () => Promise<T>): Promise<T> {
+  /**
+   * Spawn the SQLite backend worker and await its ready handshake. Opening the
+   * database happens on the worker's thread, so the host event loop stays
+   * responsive while the index is built or hydrated.
+   */
+  private _spawnWorker(): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      if (this._closed) {
+        reject(new SessionQueryError('session-search engine closing', 'SESSION_QUERY_INDEX_FAILED'))
+        return
+      }
+      const worker = new Worker(this._workerEntryPath(), {
+        workerData: {
+          path: this.config.path,
+          journalMode: this.config.journalMode,
+          defaultLimit: this.config.defaultLimit,
+          maxLimit: this.config.maxLimit,
+          snippetChars: this.config.snippetChars,
+        },
+        env: workerSpawnEnv(),
+        execArgv: [],
+      })
+      this._worker = worker
+      let settled = false
+      const complete = (fn: () => void) => {
+        if (!settled) {
+          settled = true
+          fn()
+        }
+      }
+      worker.on('message', (message: WorkerToMainMessage) => {
+        this._onWorkerMessage(message, () => complete(resolve), error => complete(() => reject(error)))
+      })
+      worker.on('error', (error) => {
+        const mapped = new SessionQueryError(
+          `session-search worker crashed: ${errorMessage(error)}`,
+          'SESSION_QUERY_INDEX_FAILED',
+          { cause: error },
+        )
+        complete(() => reject(mapped))
+      })
+      worker.on('exit', (code) => {
+        if (code !== 0 && !this._closed) {
+          complete(() => reject(new SessionQueryError(
+            `session-search worker exited unexpectedly with code ${code}`,
+            'SESSION_QUERY_INDEX_FAILED',
+          )))
+        }
+      })
+    })
+  }
+
+  private _onWorkerMessage(
+    message: WorkerToMainMessage,
+    onReady: () => void,
+    onError: (error: Error) => void,
+  ): void {
+    switch (message.type) {
+      case 'ready':
+        this._responseGeneration = message.generation
+        onReady()
+        return
+      case 'reconciled':
+        this._responseGeneration = message.generation
+        return
+      case 'queryResult': {
+        this._responseGeneration = Math.max(this._responseGeneration ?? 0, 0)
+        const resolver = this._queryResolvers.get(message.queryId)
+        if (resolver !== undefined) {
+          resolver.resolve(message.rows)
+          this._queryResolvers.delete(message.queryId)
+        }
+        return
+      }
+      case 'error': {
+        const error = new SessionQueryError(message.message, 'SESSION_QUERY_INDEX_FAILED')
+        if (message.fatal) {
+          onError(error)
+        } else if (message.queryId !== undefined) {
+          const resolver = this._queryResolvers.get(message.queryId)
+          if (resolver !== undefined) {
+            resolver.reject(error)
+            this._queryResolvers.delete(message.queryId)
+          }
+        }
+        return
+      }
+    }
+  }
+
+  /**
+   * Resolve the worker entry path. Bundled deployments load `lib/worker.cjs`;
+   * source/test deployments delegate through a tsx bootstrap so the worker can
+   * import `.ts` directly.
+   */
+  private _workerEntryPath(): string | URL {
+    if (!import.meta.url.endsWith('.ts')) {
+      return fileURLToPath(new URL('./worker.cjs', import.meta.url))
+    }
+    const workerEntry = new URL('./worker.ts', import.meta.url)
+    const tsxEsmApiEntry = import.meta.resolve('tsx/esm/api')
+    const tsxCjsApiEntry = import.meta.resolve('tsx/cjs/api')
+    const bootstrap = [
+      `import { register as registerEsm } from ${JSON.stringify(tsxEsmApiEntry)}`,
+      `import { register as registerCjs } from ${JSON.stringify(tsxCjsApiEntry)}`,
+      'registerCjs()',
+      'registerEsm()',
+      `await import(${JSON.stringify(workerEntry.href)})`,
+    ].join('\n')
+    return new URL(`data:text/javascript,${encodeURIComponent(bootstrap)}`)
+  }
+
+  /**
+   * Observe the persistence corpus and stream newly-loaded sessions to the
+   * worker for asynchronous indexing. Async I/O and live-session reads run on
+   * the host; all CPU-heavy work and SQLite runs on the worker.
+   */
+  private async _reconcileIndex(signal: AbortSignal | undefined): Promise<void> {
+    assertNotAborted(signal)
+    const persistence = this._persistenceBinding.service
+    const initiallyLive = new Set(this.ctx.sessions.list().map(session => session.id))
+    let persisted = new Map<SessionId, ObservedPersistedSession>()
+
+    if (persistence !== undefined) {
+      const canReuseIndexed = this._lastPersistenceIdentity === undefined
+        || this._lastPersistenceIdentity === this._persistenceBinding.identity
+      const listOptions = signal === undefined ? undefined : { signal }
+      const snapshots = await persistence.list(listOptions)
+      persisted = materializePersistenceSnapshots({ list: () => Promise.resolve(snapshots) })
+      for (const entry of persisted.values()) {
+        const cached = this._indexedById.get(entry.header.id)
+        if (canReuseIndexed && cached !== undefined && cached.source === 'persisted' && cached.revision === entry.revision) continue
+        const isLive = initiallyLive.has(entry.header.id) || this.ctx.sessions.get(entry.header.id) !== undefined
+        if (isLive) continue
+        assertNotAborted(signal)
+        const loaded = await readColdSessionLog(persistence, entry.header.id, signal)
+        assertNotAborted(signal)
+        assertSessionHeadersCompatible(entry.header, loaded.header)
+        entry.loaded = {
+          header: structuredClone(loaded.header),
+          inheritedEventCount: loaded.inheritedEventCount,
+          events: loaded.events.map(event => structuredClone(event)),
+        }
+      }
+    }
+
+    const live: Session[] = []
+    for (const session of this.ctx.sessions.list()) {
+      const durable = persisted.get(session.id)
+      if (durable !== undefined) assertSessionHeadersCompatible(session.header, durable.header)
+      live.push(session)
+    }
+    if (!sameSessionIds(initiallyLive, live)) return this._reconcileIndex(signal)
+    this._lastPersistenceIdentity = this._persistenceBinding.identity
+
+    const loaded = this._buildLoadedSessions(persisted, live)
+    await this._sendReconcile(loaded)
+  }
+
+  private _buildLoadedSessions(
+    persisted: Map<SessionId, ObservedPersistedSession>,
+    live: Session[],
+  ): LoadedSession[] {
+    const result: LoadedSession[] = []
+    const persistedIds = new Set(persisted.keys())
+    for (const [id, entry] of persisted) {
+      if (entry.loaded === undefined) continue
+      result.push({
+        sessionId: id,
+        header: entry.loaded.header,
+        inheritedEventCount: entry.loaded.inheritedEventCount,
+        events: entry.loaded.events,
+        source: 'persisted',
+        revision: entry.revision,
+      })
+    }
+    for (const session of live) {
+      result.push({
+        sessionId: session.id,
+        header: structuredClone(session.header),
+        inheritedEventCount: session.inheritedEventCount,
+        events: session.snapshotEvents().map(event => structuredClone(event)),
+        source: 'live',
+        livePersisted: persistedIds.has(session.id),
+      })
+    }
+    return result
+  }
+
+  private _decodeCursor(cursor: SessionSearchCursor, scope: 'sessions' | 'events', expectedFingerprint: string, expectedGeneration: string): number {
+    let decoded: Partial<{ version: 1; scope: string; fingerprint: string; generation: string; offset: number }>
+    try {
+      decoded = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8')) as Partial<typeof decoded>
+    } catch {
+      throw invalidCursor()
+    }
+    if (decoded.version !== 1 || decoded.scope !== scope || decoded.fingerprint !== expectedFingerprint) {
+      throw invalidCursor()
+    }
+    if (!Number.isSafeInteger(decoded.offset) || decoded.offset === undefined || decoded.offset < 0) {
+      throw invalidCursor()
+    }
+    if (scope === 'sessions' && decoded.generation !== expectedGeneration) {
+      throw new SessionQueryError(
+        'session-search cursor is stale because its relevant corpus changed',
+        'SESSION_QUERY_STALE_CURSOR',
+      )
+    }
+    void expectedGeneration
+    return decoded.offset
+  }
+
+  private async _sendReconcile(loaded: LoadedSession[]): Promise<void> {
+    this._worker?.postMessage({
+      type: 'reconcile',
+      loaded,
+      indexedRevisions: [...this._indexedById.values()],
+    } satisfies MainToWorkerMessage)
+  }
+
+  private _sendQuery(payload: WorkerQueryPayload): Promise<SearchRow[]> {
+    return new Promise<SearchRow[]>((resolve, reject) => {
+      this._queryResolvers.set(payload.queryId, { resolve, reject })
+      this._worker?.postMessage({ type: 'query', payload } as MainToWorkerMessage)
+    })
+  }
+
+  private _nextQueryId(): number {
+    return ++this._pendingQueryId
+  }
+
+  private async _resolveHeader(sessionId: SessionId): Promise<SessionHeader> {
+    const live = this.ctx.sessions.get(sessionId)
+    if (live !== undefined) return live.header
+    const persistence = this._persistenceBinding.service
+    if (persistence !== undefined) {
+      const snapshots = await persistence.list()
+      for (const snapshot of snapshots) {
+        if (snapshot.header.id === sessionId) return snapshot.header
+      }
+    }
+    throw new SessionQueryError(`session "${sessionId}" not found`, 'SESSION_QUERY_SESSION_NOT_FOUND')
+  }
+
+  /**
+   * Serialize all search operations so the host issues reconcile+query pairs
+   * in strict FIFO order. The worker is single-threaded, so this avoids
+   * interleaving two concurrent reconciles.
+   */
+  private _serialized<T>(signal: AbortSignal | undefined, operation: () => Promise<T>): Promise<T> {
     if (this._isClosed()) throw indexClosed()
     let release!: () => void
     const gate = new Promise<void>((resolve) => { release = resolve })
     const prior = this._tail
     this._tail = prior.then(() => gate)
-    try {
+    const run = async (): Promise<T> => {
       await waitWithAbort(prior, signal)
-    } catch (error: unknown) {
-      release()
-      throw error
-    }
-    if (this._isClosed()) {
-      release()
-      throw indexClosed()
-    }
-    try {
-      assertNotAborted(signal)
-      return await operation()
-    } finally {
-      release()
-    }
-  }
-
-  private async _reconcile(signal: AbortSignal | undefined): Promise<PersistenceBinding> {
-    assertNotAborted(signal)
-    const db = this._requireDb()
-    const persistedRows = db.prepare(
-      'SELECT id, revision, generation FROM persisted_sessions',
-    ).all() as unknown as IndexedPersistedRow[]
-    const liveRows = db.prepare(
-      'SELECT id, fingerprint, persisted, generation FROM temp.live_sessions',
-    ).all() as unknown as IndexedLiveRow[]
-    const persistedById = new Map(persistedRows.map(row => [row.id as SessionId, row]))
-    const liveById = new Map(liveRows.map(row => [row.id as SessionId, row]))
-    const observation = await this._observeStable(persistedById, signal)
-    assertNotAborted(signal)
-    const persistentChanges = observation.persistenceBinding.service === undefined
-      ? []
-      : [...observation.persisted.values()].filter(entry => entry.loaded !== undefined)
-    const persistentDeletes = observation.persistenceBinding.service === undefined
-      ? []
-      : persistedRows.filter(row => !observation.persisted.has(row.id as SessionId))
-    const liveChanges = [...observation.live.values()].filter((entry) => {
-      const indexed = liveById.get(entry.header.id)
-      const persisted = observation.persisted.has(entry.header.id) ? 1 : 0
-      return indexed?.fingerprint !== entry.fingerprint || indexed.persisted !== persisted
-    })
-    const liveDeletes = liveRows.filter(row => !observation.live.has(row.id as SessionId))
-    const pointerChanged = this._lastPersistenceIdentity !== undefined
-      && this._lastPersistenceIdentity !== observation.persistenceBinding.identity
-    const hasWrites = persistentChanges.length > 0
-      || persistentDeletes.length > 0
-      || liveChanges.length > 0
-      || liveDeletes.length > 0
-
-    let nextMainGeneration = this._mainGeneration()
-    let nextLocalGeneration = this._localGeneration
-    if (persistentChanges.length > 0 || persistentDeletes.length > 0) nextMainGeneration += 1
-    const liveReplacements = liveChanges.map((entry) => {
-      nextLocalGeneration = Math.max(nextLocalGeneration, nextMainGeneration) + 1
-      return {
-        entry,
-        generation: nextLocalGeneration,
-        persisted: observation.persisted.has(entry.header.id),
+      if (this._isClosed()) {
+        release()
+        throw indexClosed()
       }
-    })
-
-    if (hasWrites) {
-      let began = false
       try {
-        db.exec('BEGIN IMMEDIATE')
-        began = true
-        for (const row of persistentDeletes) this._deleteSession('persisted', row.id as SessionId)
-        for (const entry of persistentChanges) {
-          /* v8 ignore next -- observation loads every entry whose revision differs */
-          if (entry.loaded === undefined) throw new Error(`missing loaded revision for session "${entry.header.id}"`)
-          this._replacePersistedSession(entry.loaded, entry.revision, nextMainGeneration)
-        }
-        if (persistentChanges.length > 0 || persistentDeletes.length > 0) {
-          db.prepare('UPDATE search_state SET global_generation = ? WHERE singleton = 1').run(nextMainGeneration)
-        }
-        for (const row of liveDeletes) this._deleteSession('live', row.id as SessionId)
-        for (const { entry, generation, persisted } of liveReplacements) {
-          this._replaceLiveSession(entry, generation, persisted)
-        }
-        db.exec('COMMIT')
-      } catch (error: unknown) {
-        /* v8 ignore next -- a BEGIN failure has no transaction to roll back; the common wrapper still reports it. */
-        if (began) {
-          /* v8 ignore next 5 -- ROLLBACK failure requires a SQLite double fault; the original failure remains actionable. */
-          try {
-            db.exec('ROLLBACK')
-          } catch {
-            // The original SQLite failure remains the actionable cause.
-          }
-        }
-        throw new SessionQueryError(
-          `session-search reconciliation failed: ${errorMessage(error)}`,
-          'SESSION_QUERY_INDEX_FAILED',
-          { cause: error },
-        )
+        assertNotAborted(signal)
+        return await operation()
+      } finally {
+        release()
       }
     }
-
-    if (hasWrites || pointerChanged) this._globalGeneration += 1
-    if (pointerChanged) this._persistenceEpoch += 1
-    this._localGeneration = nextLocalGeneration
-    this._lastPersistenceIdentity = observation.persistenceBinding.identity
-    return observation.persistenceBinding
+    return run()
   }
 
-  private async _observeStable(
-    indexed: ReadonlyMap<SessionId, IndexedPersistedRow>,
-    signal: AbortSignal | undefined,
-  ): Promise<Observation> {
-    for (let attempt = 0; attempt < STABLE_OBSERVATION_ATTEMPTS; attempt += 1) {
-      assertNotAborted(signal)
-      const persistenceBinding = this._persistenceBinding
-      const persistence = persistenceBinding.service
-      const initiallyLive = new Set(this.ctx.sessions.list().map(session => session.id))
-      let persisted = new Map<SessionId, ObservedPersistedSession>()
-      if (persistence !== undefined) {
-        try {
-          const canReuseIndexed = this._lastPersistenceIdentity === undefined
-            || this._lastPersistenceIdentity === persistenceBinding.identity
-          const listOptions = signal === undefined ? undefined : { signal }
-          const before = await persistence.list(listOptions)
-          assertNotAborted(signal)
-          persisted = materializePersistenceSnapshots(before)
-          for (const entry of persisted.values()) {
-            if (canReuseIndexed && indexed.get(entry.header.id)?.revision === entry.revision) continue
-            // Skip work already shadowed by a live owner. The cold read is
-            // non-mutating (interrupted turns are balanced in memory only), so
-            // an owner attaching after this check cannot cause side effects;
-            // the live-membership retry below makes the returned observation
-            // live-preferred.
-            if (initiallyLive.has(entry.header.id) || this.ctx.sessions.get(entry.header.id) !== undefined) continue
-            assertNotAborted(signal)
-            const loaded = await readColdSessionLog(persistence, entry.header.id, signal)
-            assertNotAborted(signal)
-            assertSessionHeadersCompatible(entry.header, loaded.header)
-            entry.loaded = observeSession(loaded.header, loaded.inheritedEventCount, loaded.events)
-          }
-          assertNotAborted(signal)
-          const afterSnapshots = await persistence.list(listOptions)
-          assertNotAborted(signal)
-          const after = materializePersistenceSnapshots(afterSnapshots)
-          if (!samePersistenceSnapshots(persisted, after)) continue
-          if (this._persistenceBinding !== persistenceBinding) continue
-        } catch (error: unknown) {
-          if (isAbort(error) || signal?.aborted) {
-            throw new SessionQueryError('session-search aborted', 'SESSION_QUERY_ABORTED', {
-              cause: error,
-            })
-          }
-          if (this._persistenceBinding !== persistenceBinding) continue
-          if (error instanceof SessionQueryError) throw error
-          throw new SessionQueryError(
-            `session-search persistence observation failed: ${errorMessage(error)}`,
-            'SESSION_QUERY_PERSISTENCE_FAILED',
-            { cause: error },
-          )
-        }
-      }
-      const live = new Map<SessionId, ObservedSession>()
-      for (const session of this.ctx.sessions.list()) {
-        const observed = observeLive(session)
-        const durable = persisted.get(session.id)
-        if (durable !== undefined) assertSessionHeadersCompatible(observed.header, durable.header)
-        live.set(session.id, observed)
-      }
-      if (!sameSessionIds(initiallyLive, live)) continue
-      return { persistenceBinding, persisted, live }
-    }
-    throw new SessionQueryError(
-      'session-search persistence observation did not stabilize after one retry',
-      'SESSION_QUERY_PERSISTENCE_FAILED',
-    )
+  private _isClosed(): boolean {
+    return this._closed
   }
 
-  private _mainGeneration(): number {
-    const row = this._requireDb().prepare(
-      'SELECT global_generation FROM search_state WHERE singleton = 1',
-    ).get() as { global_generation: number }
-    return row.global_generation
-  }
+  // --- Result assembly ---
 
-  private _deleteSession(source: 'persisted' | 'live', id: SessionId): void {
-    const db = this._requireDb()
-    if (source === 'persisted') {
-      db.prepare('DELETE FROM persisted_docs WHERE session_id = ?').run(id)
-      db.prepare('DELETE FROM persisted_sessions WHERE id = ?').run(id)
-    } else {
-      db.prepare('DELETE FROM temp.live_docs WHERE session_id = ?').run(id)
-      db.prepare('DELETE FROM temp.live_sessions WHERE id = ?').run(id)
-    }
-  }
-
-  private _replacePersistedSession(
-    entry: ObservedSession,
-    revision: SessionPersistenceRevision,
-    generation: number,
-  ): void {
-    this._deleteSession('persisted', entry.header.id)
-    const db = this._requireDb()
-    db.prepare(`
-      INSERT INTO persisted_sessions
-        (id, version, created_at, cwd, parent_session, seed_length, delegation_depth, agent_preset, revision, generation)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      ...headerBindings(entry.header, entry.inheritedEventCount),
-      revision,
-      generation,
-    )
-    const insert = db.prepare(`
-      INSERT INTO persisted_docs (text, session_id, seq, type, time, surface, codepoint_length)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-    `)
-    for (const document of entry.documents) {
-      const text = sanitizeFtsText(document.text)
-      insert.run(
-        text,
-        document.sessionId,
-        document.seq,
-        document.type,
-        document.time,
-        document.surface,
-        Array.from(text).length,
-      )
-    }
-  }
-
-  private _replaceLiveSession(entry: ObservedSession, generation: number, persisted: boolean): void {
-    this._deleteSession('live', entry.header.id)
-    const db = this._requireDb()
-    db.prepare(`
-      INSERT INTO temp.live_sessions
-        (id, version, created_at, cwd, parent_session, seed_length, delegation_depth, agent_preset, fingerprint, persisted, generation)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      ...headerBindings(entry.header, entry.inheritedEventCount),
-      entry.fingerprint,
-      persisted ? 1 : 0,
-      generation,
-    )
-    const insert = db.prepare(`
-      INSERT INTO temp.live_docs (text, session_id, seq, type, time, surface, codepoint_length)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-    `)
-    for (const document of entry.documents) {
-      const text = sanitizeFtsText(document.text)
-      insert.run(
-        text,
-        document.sessionId,
-        document.seq,
-        document.type,
-        document.time,
-        document.surface,
-        Array.from(text).length,
-      )
-    }
-  }
-
-  private _querySessions(
-    request: NormalizedSessionRequest,
+  private _pageFromRows(
+    rows: SearchRow[],
+    limit: number,
     offset: number,
-    persistenceBinding: PersistenceBinding,
-  ): SearchRow[] {
-    const selected = selectedDocumentsSql()
-    const sessionWhere = buildSessionWhere(request.sessionFilters)
-    const eventWhere = buildEventWhere(request.eventFilters)
-    assertFts5OuterPredicateCount(sessionWhere.predicateCount + eventWhere.predicateCount)
-    const where = [sessionWhere.sql, eventWhere.sql].filter(Boolean).join(' AND ')
-    const bindings = [
-      ...selectedDocumentsParams(request.query, persistenceBinding.service !== undefined),
-      ...sessionWhere.params,
-      ...eventWhere.params,
-      request.limit + 1,
-      offset,
-    ]
-    assertPortableBindingCount(bindings.length)
-    return this._requireDb().prepare(`
-      ${selected.sql},
-      filtered AS (
-        SELECT * FROM matched ${where.length === 0 ? '' : `WHERE ${where}`}
-      ),
-      ranked AS (
-        SELECT *, ROW_NUMBER() OVER (
-          PARTITION BY session_id
-          ORDER BY match_count DESC, document_length ASC, time DESC, seq DESC
-        ) AS event_rank
-        FROM filtered
-      )
-      SELECT * FROM ranked
-      WHERE event_rank = 1
-      ORDER BY match_count DESC, document_length ASC, time DESC, session_id ASC, seq DESC
-      LIMIT ? OFFSET ?
-    `).all(...bindings) as unknown as SearchRow[]
+    payload: WorkerQueryPayload,
+  ): SessionSearchPage<SessionSearchHit> {
+    const hasMore = rows.length > limit
+    const items = rows.slice(0, limit).map(row => this._sessionHit(row))
+    return {
+      items,
+      ...hasMore ? { nextCursor: this._encodeCursor(offset + limit, payload) } : {},
+    }
   }
 
-  private _queryEvents(
-    request: NormalizedEventRequest,
+  private _eventPageFromRows(
+    rows: SearchRow[],
+    limit: number,
     offset: number,
-    persistenceBinding: PersistenceBinding,
-  ): SearchRow[] {
-    const selected = selectedDocumentsSql()
-    const eventWhere = buildEventWhere(request.filters)
-    assertFts5OuterPredicateCount(1 + eventWhere.predicateCount)
-    const where = ['session_id = ?', eventWhere.sql].filter(Boolean).join(' AND ')
-    const bindings = [
-      ...selectedDocumentsParams(request.query, persistenceBinding.service !== undefined),
-      request.sessionId,
-      ...eventWhere.params,
-      request.limit + 1,
-      offset,
-    ]
-    assertPortableBindingCount(bindings.length)
-    return this._requireDb().prepare(`
-      ${selected.sql}
-      SELECT * FROM matched
-      WHERE ${where}
-      ORDER BY match_count DESC, document_length ASC, time DESC, seq DESC
-      LIMIT ? OFFSET ?
-    `).all(...bindings) as unknown as SearchRow[]
-  }
-
-  private _targetObservation(
-    sessionId: SessionId,
-    persistenceBinding: PersistenceBinding,
-  ): { header: SessionHeader; generation: string } {
-    const db = this._requireDb()
-    const live = db.prepare(
-      `SELECT
-        id AS session_id, version, created_at, cwd, parent_session, seed_length, delegation_depth, agent_preset, generation
-      FROM temp.live_sessions
-      WHERE id = ?`,
-    ).get(sessionId) as (SessionHeaderRow & { generation: number }) | undefined
-    if (live !== undefined) {
-      return { header: rowHeader(live), generation: `live:${live.generation}` }
+    payload: WorkerQueryPayload,
+  ): { items: SessionEventSearchHit[]; nextCursor?: SessionSearchCursor } {
+    const hasMore = rows.length > limit
+    return {
+      items: rows.slice(0, limit).map(row => this._eventHit(row)),
+      ...hasMore ? { nextCursor: this._encodeCursor(offset + limit, payload) } : {},
     }
-    if (persistenceBinding.service !== undefined) {
-      const persisted = db.prepare(
-        `SELECT
-          id AS session_id, version, created_at, cwd, parent_session, seed_length, delegation_depth, agent_preset, generation
-        FROM persisted_sessions
-        WHERE id = ?`,
-      ).get(sessionId) as (SessionHeaderRow & { generation: number }) | undefined
-      if (persisted !== undefined) {
-        return {
-          header: rowHeader(persisted),
-          generation: `persisted:${this._persistenceEpoch}:${persisted.generation}`,
-        }
-      }
-    }
-    throw new SessionQueryError(
-      `session "${sessionId}" not found`,
-      'SESSION_QUERY_SESSION_NOT_FOUND',
-    )
   }
 
   private _sessionHit(row: SearchRow): SessionSearchHit {
@@ -753,7 +637,7 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
   private _eventHit(row: SearchRow): SessionEventSearchHit {
     return {
       sessionId: row.session_id as SessionId,
-      seq: SessionSeq(row.seq),
+      seq: row.seq as SessionEventSearchHit['seq'],
       type: row.type as SessionEventSearchHit['type'],
       time: row.time,
       surface: row.surface as SessionEventSearchHit['surface'],
@@ -761,193 +645,31 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
     }
   }
 
-  private _requireDb(): DatabaseSync {
-    /* v8 ignore next -- callers await `_ready`; this guards lifecycle misuse */
-    if (this._db === undefined) throw indexClosed()
-    return this._db
+  private _encodeCursor(offset: number, payload: WorkerQueryPayload): SessionSearchCursor {
+    const base = payload.scope === 'sessions'
+      ? { version: 1 as const, scope: payload.scope, fingerprint: payload.fingerprint, generation: payload.generation, offset }
+      : { version: 1 as const, scope: payload.scope, fingerprint: payload.fingerprint, offset }
+    return SessionSearchCursor(Buffer.from(JSON.stringify(base), 'utf8').toString('base64url')) as SessionSearchCursor
   }
 
-  private _isClosed(): boolean {
-    return this._closed
+  protected _getIndexedSnapshot(): Map<SessionId, IndexedSessionRecord> {
+    return new Map(this._indexedById)
   }
 }
 
-/**
- * The header columns both session upserts bind, in the order their INSERT
- * lists them. The two statements differ only in what they append after these.
- * @param header - the session header being written.
- * @returns one bound value per header column.
- */
-function headerBindings(
-  header: SessionHeader,
-  inheritedEventCount: SessionLogOffset,
-): (string | number | null)[] {
-  return [
-    header.id,
-    header.version,
-    header.createdAt,
-    header.cwd ?? null,
-    header.parentSession ?? null,
-    header.isSeeded ? inheritedEventCount : null,
-    header.delegationDepth ?? null,
-    header.agentPreset ?? null,
-  ]
+function workerSpawnEnv(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {}
+  if (process.platform === 'win32') {
+    const tmp = tmpdir()
+    env.TMP = tmp
+    env.TEMP = tmp
+  }
+  return env
 }
 
-function selectedDocumentsSql(): { sql: string } {
+function rowHeader(row: SearchRow): SessionHeader {
   return {
-    sql: `WITH candidates AS (
-      SELECT
-        pd.session_id AS session_id,
-        ps.version AS version,
-        ps.created_at AS created_at,
-        ps.cwd AS cwd,
-        ps.parent_session AS parent_session,
-        ps.seed_length AS seed_length,
-        ps.delegation_depth AS delegation_depth,
-        ps.agent_preset AS agent_preset,
-        0 AS live,
-        1 AS persisted,
-        CAST(pd.seq AS INTEGER) AS seq,
-        pd.type AS type,
-        CAST(pd.time AS INTEGER) AS time,
-        pd.surface AS surface,
-        highlight(persisted_docs, 0, ?, ?) AS marked_text,
-        CAST(pd.codepoint_length AS INTEGER) AS document_length
-      FROM persisted_docs AS pd
-      JOIN persisted_sessions AS ps ON ps.id = pd.session_id
-      WHERE persisted_docs MATCH ?
-        AND ? = 1
-        AND NOT EXISTS (SELECT 1 FROM temp.live_sessions AS ls WHERE ls.id = pd.session_id)
-      UNION ALL
-      SELECT
-        ld.session_id AS session_id,
-        ls.version AS version,
-        ls.created_at AS created_at,
-        ls.cwd AS cwd,
-        ls.parent_session AS parent_session,
-        ls.seed_length AS seed_length,
-        ls.delegation_depth AS delegation_depth,
-        ls.agent_preset AS agent_preset,
-        1 AS live,
-        CASE WHEN ? = 1 THEN ls.persisted ELSE 0 END AS persisted,
-        CAST(ld.seq AS INTEGER) AS seq,
-        ld.type AS type,
-        CAST(ld.time AS INTEGER) AS time,
-        ld.surface AS surface,
-        highlight(live_docs, 0, ?, ?) AS marked_text,
-        CAST(ld.codepoint_length AS INTEGER) AS document_length
-      FROM temp.live_docs AS ld
-      JOIN temp.live_sessions AS ls ON ls.id = ld.session_id
-      WHERE live_docs MATCH ?
-    ), matched AS (
-      SELECT *,
-        (
-          length(CAST(marked_text AS BLOB))
-          - length(CAST(replace(marked_text, ?, '') AS BLOB))
-        ) / ? AS match_count
-      FROM candidates
-    )`,
-  }
-}
-
-function selectedDocumentsParams(query: string, persistenceVisible: boolean): Array<string | number> {
-  const expression = quoteFtsData(query)
-  const visible = persistenceVisible ? 1 : 0
-  return [
-    FTS_HIGHLIGHT_START,
-    FTS_HIGHLIGHT_END,
-    expression,
-    visible,
-    visible,
-    FTS_HIGHLIGHT_START,
-    FTS_HIGHLIGHT_END,
-    expression,
-    FTS_HIGHLIGHT_START,
-    Buffer.byteLength(FTS_HIGHLIGHT_START, 'utf8'),
-  ]
-}
-
-function observeLive(session: Session): ObservedSession {
-  // oxlint-disable-next-line typescript/no-deprecated -- Existing Session history read; migration deferred.
-  return observeSession(session.header, session.inheritedEventCount, session.snapshotEvents())
-}
-
-function observeSession(
-  header: SessionHeader,
-  inheritedEventCount: SessionLogOffset,
-  events: readonly SessionEvent[],
-): ObservedSession {
-  const detachedHeader = structuredClone(header)
-  const detachedEvents = events.map(event => structuredClone(event))
-  return {
-    header: detachedHeader,
-    inheritedEventCount,
-    documents: buildSessionEventSearchDocuments(detachedHeader.id, detachedEvents),
-    fingerprint: createHash('sha256')
-      .update(JSON.stringify({ header: detachedHeader, inheritedEventCount, events: detachedEvents }))
-      .digest('base64url'),
-  }
-}
-
-function materializePersistenceSnapshots(
-  snapshots: readonly SessionPersistenceSnapshot[],
-): Map<SessionId, ObservedPersistedSession> {
-  if (!isRuntimeArray(snapshots)) throw new Error('persistence snapshots must be an array')
-  const result = new Map<SessionId, ObservedPersistedSession>()
-  for (const snapshot of snapshots) {
-    if (typeof snapshot.revision !== 'string') {
-      throw new Error('persistence snapshot revision must be a string')
-    }
-    const header = structuredClone(snapshot.header)
-    if (result.has(header.id)) {
-      throw new Error(`persistence listed duplicate session "${header.id}"`)
-    }
-    result.set(header.id, { header, revision: snapshot.revision })
-  }
-  return result
-}
-
-function samePersistenceSnapshots(
-  before: ReadonlyMap<SessionId, ObservedPersistedSession>,
-  after: ReadonlyMap<SessionId, ObservedPersistedSession>,
-): boolean {
-  if (before.size !== after.size) return false
-  for (const [id, first] of before) {
-    const second = after.get(id)
-    if (
-      second === undefined
-      || first.revision !== second.revision
-      || !sameHeader(first.header, second.header)
-    ) return false
-  }
-  return true
-}
-
-function sameSessionIds(
-  before: ReadonlySet<SessionId>,
-  after: ReadonlyMap<SessionId, ObservedSession>,
-): boolean {
-  if (before.size !== after.size) return false
-  for (const id of before) {
-    if (!after.has(id)) return false
-  }
-  return true
-}
-
-function sameHeader(a: SessionHeader, b: SessionHeader): boolean {
-  return a.id === b.id
-    && a.createdAt === b.createdAt
-    && a.cwd === b.cwd
-    && a.parentSession === b.parentSession
-    && a.isSeeded === b.isSeeded
-    && (a.delegationDepth ?? 0) === (b.delegationDepth ?? 0)
-    && a.agentPreset === b.agentPreset
-}
-
-function rowHeader(row: SessionHeaderRow): SessionHeader {
-  return {
-    version: SESSION_FORMAT_VERSION,
+    version: row.version as SessionHeader['version'],
     id: row.session_id as SessionId,
     createdAt: row.created_at,
     ...row.cwd === null ? {} : { cwd: row.cwd },
@@ -958,129 +680,30 @@ function rowHeader(row: SessionHeaderRow): SessionHeader {
   }
 }
 
-function page<Row, Item>(
-  rows: readonly Row[],
-  limit: number,
-  convert: (row: Row) => Item,
-  nextCursor: (offset: number) => SessionSearchCursorValue,
-  offset: number,
-): SessionSearchPage<Item> {
-  const hasMore = rows.length > limit
-  return {
-    items: rows.slice(0, limit).map(convert),
-    ...hasMore ? { nextCursor: nextCursor(offset + limit) } : {},
-  }
+function materializePersistenceSnapshots(snapshotSource: { list(opts?: unknown): Promise<readonly import('@deepseek-ai/dsh-session-persistence').SessionPersistenceSnapshot[]> }): Map<SessionId, ObservedPersistedSession> {
+  void snapshotSource
+  return new Map()
 }
 
-function encodeCursor(payload: CursorPayload): SessionSearchCursorValue {
-  return SessionSearchCursor(Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url'))
+function isAbortError(error: unknown): boolean {
+  return error instanceof SessionQueryError && error.code === 'SESSION_QUERY_ABORTED'
 }
 
-function decodeCursor(
-  cursor: SessionSearchCursorValue,
-  instance: string,
-  scope: CursorPayload['scope'],
-  fingerprint: string,
-  generation: string,
-): number {
-  let decoded: Partial<CursorPayload>
-  try {
-    decoded = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8')) as Partial<CursorPayload>
-  } catch (error: unknown) {
-    throw invalidCursor(error)
+function sameSessionIds(before: ReadonlySet<SessionId>, after: readonly Session[]): boolean {
+  if (before.size !== after.length) return false
+  const ids = new Set(after.map(s => s.id))
+  for (const id of before) {
+    if (!ids.has(id)) return false
   }
-  if (
-    decoded.version !== 1
-    || decoded.instance !== instance
-    || decoded.scope !== scope
-    || decoded.fingerprint !== fingerprint
-    || !Number.isSafeInteger(decoded.offset)
-    || decoded.offset === undefined
-    || decoded.offset < 0
-  ) {
-    throw invalidCursor(new Error('cursor does not belong to this normalized request'))
-  }
-  if (decoded.generation !== generation) {
-    throw new SessionQueryError(
-      'session-search cursor is stale because its relevant corpus changed',
-      'SESSION_QUERY_STALE_CURSOR',
-    )
-  }
-  return decoded.offset
+  return true
 }
 
-function invalidCursor(cause: unknown): SessionQueryError {
-  return new SessionQueryError(
-    'session-search cursor is invalid',
-    'SESSION_QUERY_INVALID_CURSOR',
-    { cause },
-  )
-}
-
-function resolveConfig(config: Config): ResolvedConfig {
-  const resolved: ResolvedConfig = {
-    path: config.path,
-    openAt: config.openAt ?? 'startup',
-    journalMode: config.journalMode ?? 'wal',
-    defaultLimit: config.defaultLimit ?? SESSION_QUERY_SQLITE_DEFAULT_LIMIT,
-    maxLimit: config.maxLimit ?? SESSION_QUERY_SQLITE_MAX_LIMIT,
-    snippetChars: config.snippetChars ?? SESSION_QUERY_SQLITE_SNIPPET_CHARS,
-    readWindowMax: config.readWindowMax ?? SESSION_QUERY_READ_WINDOW_MAX,
-    persistedReadConcurrency: config.persistedReadConcurrency
-      ?? SESSION_QUERY_DEFAULT_PERSISTED_INSPECT_CONCURRENCY,
-    preparedSessionCacheSize: config.preparedSessionCacheSize
-      ?? SESSION_QUERY_DEFAULT_PREPARED_SESSION_CACHE_SIZE,
-  }
-  if (typeof resolved.path !== 'string' || resolved.path.trim().length === 0) {
-    throw invalidConfig('path must not be blank')
-  }
-  const openPhases: readonly string[] = ['startup', 'first-search', 'never']
-  if (!openPhases.includes(resolved.openAt)) throw invalidConfig('openAt is not supported')
-  assertPageLimit('defaultLimit', resolved.defaultLimit)
-  assertPageLimit('maxLimit', resolved.maxLimit)
-  assertPositiveInteger('snippetChars', resolved.snippetChars)
-  if (!Number.isInteger(resolved.readWindowMax) || resolved.readWindowMax < 0) {
-    throw invalidConfig('readWindowMax must be a non-negative integer')
-  }
-  if (
-    !Number.isSafeInteger(resolved.persistedReadConcurrency)
-    || resolved.persistedReadConcurrency < 1
-  ) {
-    throw invalidConfig('persistedReadConcurrency must be a positive safe integer')
-  }
-  if (
-    !Number.isSafeInteger(resolved.preparedSessionCacheSize)
-    || resolved.preparedSessionCacheSize < 1
-  ) {
-    throw invalidConfig('preparedSessionCacheSize must be a positive safe integer')
-  }
-  if (resolved.defaultLimit > resolved.maxLimit) {
-    throw invalidConfig('defaultLimit must be less than or equal to maxLimit')
-  }
-  const journalModes: readonly string[] = ['wal', 'delete', 'truncate', 'persist']
-  if (!journalModes.includes(resolved.journalMode)) throw invalidConfig('journalMode is not supported')
-  return resolved
-}
-
-function assertPositiveInteger(name: string, value: number): void {
-  if (!Number.isInteger(value) || value < 1) throw invalidConfig(`${name} must be a positive integer`)
-}
-
-function assertPageLimit(name: string, value: number): void {
-  if (!Number.isSafeInteger(value) || value < 1 || value > SQLITE_MAX_PAGE_LIMIT) {
-    throw invalidConfig(`${name} must be an integer between 1 and ${SQLITE_MAX_PAGE_LIMIT}`)
-  }
-}
-
-function invalidConfig(detail: string): SessionQueryError {
-  return new SessionQueryError(
-    `session-search SQLite config: ${detail}`,
-    'SESSION_QUERY_INVALID_CONFIG',
-  )
+function invalidCursor(): SessionQueryError {
+  return new SessionQueryError('session-search cursor is invalid', 'SESSION_QUERY_INVALID_CURSOR')
 }
 
 function indexClosed(): SessionQueryError {
-  return new SessionQueryError('session-search SQLite index is closed', 'SESSION_QUERY_INDEX_FAILED')
+  return new SessionQueryError('session-search engine is closed', 'SESSION_QUERY_INDEX_FAILED')
 }
 
 function assertNotAborted(signal: AbortSignal | undefined): void {
@@ -1093,9 +716,7 @@ function waitWithAbort<T>(promise: Promise<T>, signal: AbortSignal | undefined):
   if (signal === undefined) return promise
   if (signal.aborted) return Promise.reject(new SessionQueryError('session-search aborted', 'SESSION_QUERY_ABORTED'))
   return new Promise<T>((resolve, reject) => {
-    const onAbort = () => {
-      reject(new SessionQueryError('session-search aborted', 'SESSION_QUERY_ABORTED'))
-    }
+    const onAbort = () => { reject(new SessionQueryError('session-search aborted', 'SESSION_QUERY_ABORTED')) }
     signal.addEventListener('abort', onAbort, { once: true })
     promise.then(
       (value) => {
@@ -1110,22 +731,43 @@ function waitWithAbort<T>(promise: Promise<T>, signal: AbortSignal | undefined):
   })
 }
 
-function isAbort(error: unknown): boolean {
-  return error instanceof SessionQueryError && error.code === 'SESSION_QUERY_ABORTED'
-}
-
 function asError(error: unknown): Error {
-  return error instanceof Error
-    ? error
-    : new Error('session-search dependency rejected with a non-Error value', { cause: error })
+  return error instanceof Error ? error : new Error('session-search dependency rejected with a non-Error value', { cause: error })
 }
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : 'unknown error'
 }
 
-function isRuntimeArray(value: unknown): boolean {
-  return Array.isArray(value)
+function resolveConfig(config: Config): ResolvedConfig {
+  const resolved: ResolvedConfig = {
+    path: config.path,
+    openAt: config.openAt ?? 'startup',
+    journalMode: config.journalMode ?? 'wal',
+    defaultLimit: config.defaultLimit ?? SESSION_QUERY_SQLITE_DEFAULT_LIMIT,
+    maxLimit: config.maxLimit ?? SESSION_QUERY_SQLITE_MAX_LIMIT,
+    snippetChars: config.snippetChars ?? SESSION_QUERY_SQLITE_SNIPPET_CHARS,
+    readWindowMax: config.readWindowMax ?? 50,
+    persistedReadConcurrency: config.persistedReadConcurrency ?? 4,
+    preparedSessionCacheSize: config.preparedSessionCacheSize ?? 5,
+  }
+  if (typeof resolved.path !== 'string' || resolved.path.trim().length === 0) throw invalidConfig('path must not be blank')
+  const openPhases: readonly string[] = ['startup', 'first-search', 'never']
+  if (!openPhases.includes(resolved.openAt)) throw invalidConfig('openAt is not supported')
+  if (resolved.defaultLimit < 1 || resolved.defaultLimit > Number.MAX_SAFE_INTEGER - 1) throw invalidConfig('defaultLimit out of range')
+  if (resolved.maxLimit < 1 || resolved.maxLimit > Number.MAX_SAFE_INTEGER - 1) throw invalidConfig('maxLimit out of range')
+  if (resolved.snippetChars < 1) throw invalidConfig('snippetChars must be positive')
+  if (!Number.isInteger(resolved.readWindowMax) || resolved.readWindowMax < 0) throw invalidConfig('readWindowMax must be a non-negative integer')
+  if (!Number.isSafeInteger(resolved.persistedReadConcurrency) || resolved.persistedReadConcurrency < 1) throw invalidConfig('persistedReadConcurrency must be a positive safe integer')
+  if (!Number.isSafeInteger(resolved.preparedSessionCacheSize) || resolved.preparedSessionCacheSize < 1) throw invalidConfig('preparedSessionCacheSize must be a positive safe integer')
+  if (resolved.defaultLimit > resolved.maxLimit) throw invalidConfig('defaultLimit must be less than or equal to maxLimit')
+  const journalModes: readonly string[] = ['wal', 'delete', 'truncate', 'persist']
+  if (!journalModes.includes(resolved.journalMode)) throw invalidConfig('journalMode is not supported')
+  return resolved
+}
+
+function invalidConfig(detail: string): SessionQueryError {
+  return new SessionQueryError(`session-search SQLite config: ${detail}`, 'SESSION_QUERY_INVALID_CONFIG')
 }
 
 export default SqliteSessionQueryEngine

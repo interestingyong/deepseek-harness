@@ -342,6 +342,13 @@ export interface ConversationSessionInjected {
   }
   /** Bind input draft persistence to the Session-owned store instance. */
   bindDraftPersistence: (write: (draft: DraftSnapshot) => void) => () => void
+  /**
+   * Bind the conversation store's history array to the input shell so the
+   * user can recall prior submissions with PgUp/PgDn. `get` reads the current
+   * history; `push` records one submitted draft (store-owned dedup/cap policy).
+   * @returns the unbind disposer.
+   */
+  bindHistory: (get: () => readonly string[], push: (text: string) => void) => () => void
   /** Select and activate one View while addressing an opaque focus request to it. */
   openView: (view: string, focus: string) => void
 }

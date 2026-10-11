@@ -12,7 +12,7 @@ import css from './ConversationRoot.module.css'
  */
 export function DefaultConversationViews({
   view, useSession, useConversation, useConversationViews, inputActions, useStore, actions,
-  renderSlot, bindDraftPersistence, openView, useInspectCall,
+  renderSlot, bindDraftPersistence, bindHistory, openView, useInspectCall,
 }: ConversationSessionSlotProps) {
   const tabs = useConversationViews(value => value)
   const inspectCall = useInspectCall(value => value)
@@ -21,6 +21,7 @@ export function DefaultConversationViews({
   const session = useSession(s => s)
   const conversation = useConversation(s => s)
   const viewRequest = useStore(s => s.viewRequest ?? null)
+  const history = useStore(s => s.history)
 
   useEffect(() => {
     const unbindDraftPersistence = bindDraftPersistence(actions.setDraft)
@@ -28,6 +29,11 @@ export function DefaultConversationViews({
     return () => { unbindDraftPersistence() }
     // The Session input owns content before this persistence writer is attached.
   }, [inputActions])
+
+  useEffect(() => {
+    const unbindHistory = bindHistory(() => history, actions.pushHistory)
+    return () => { unbindHistory() }
+  }, [history, actions])
 
   if (session.blank && conversationPhase(session, conversation) === 'blank') return null
   const viewId = view ?? active?.id

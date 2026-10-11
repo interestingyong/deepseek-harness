@@ -708,7 +708,7 @@ describe('ui-workspace apply', () => {
       items: [{ sessionId: 'session', snippet: 'match' }],
       hasMore: false,
     })
-    expect(b.search).toHaveBeenCalledWith('match', signal)
+    expect(b.search).toHaveBeenCalledWith('match', signal, undefined)
     expect(browser.searchResultLimit).toBe(20)
     await browser.renameWorkspace('ws' as never, 'renamed')
     expect(b.rename).toHaveBeenCalledWith('ws', 'renamed')

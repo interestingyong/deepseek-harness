@@ -263,13 +263,13 @@ export class SessionController extends TypertRemoteService {
 
   /**
    * Search visible Session content without resuming an Agent.
-   * @param request - literal message-content query.
+   * @param request - literal message-content query and optional surface scope.
    * @param signal - cancellation for list and search reads.
    * @returns authorized bounded Session search results.
    */
   @Remote('search')
   search(request: SessionSearchRequest, signal: AbortSignal): Promise<SessionSearchValue> {
-    return this.listState.search(request.query, signal)
+    return this.listState.search(request, signal)
   }
 
   /**

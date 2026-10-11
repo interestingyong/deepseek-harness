@@ -77,6 +77,12 @@ export interface ComposerKeyboard {
   /** Dismiss the popupSelect shell (any interaction outside the box). */
   dismissPopup(): void
   /**
+   * Recall a prior submission via PgUp/PgDn. `older` walks toward the
+   * earliest entry, `newer` toward the live draft. Returns true when the
+   * recall applied.
+   */
+  recall(direction: 'older' | 'newer'): boolean
+  /**
    * Bind the mounted composer's file action and live intake availability.
    * @param picker - availability query and native file-dialog opener.
    * @returns the unbind disposer.

@@ -273,9 +273,18 @@ export interface SessionListValue {
   readonly items: readonly SessionSummary[]
 }
 
+/**
+ * Which logged messages one search may match: `current` restricts hits to the
+ * current model-visible surface; `all` also matches shadowed messages that a
+ * later surface replacement (compaction, prune) superseded.
+ */
+export type SessionSearchScope = 'current' | 'all'
+
 /** Session search request. */
 export interface SessionSearchRequest {
   readonly query: string
+  /** Surface scope of the search; omitted means `current`. */
+  readonly scope?: SessionSearchScope
 }
 
 /** Session search response value. */

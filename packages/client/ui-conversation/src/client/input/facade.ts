@@ -149,6 +149,12 @@ export class SessionInputShell implements SessionInput {
   private disposed = false
   /** Conversation store writer for the current semantic document. */
   private persistDraft: ((draft: DraftSnapshot) => void) | undefined
+  /** History binding for PgUp/PgDn draft recall; unbound until bindHistory. */
+  private historyBinding: { get: () => readonly string[]; push: (text: string) => void } | undefined
+  /** Stashed live draft while walking history; undefined when not walking. */
+  private stashedDraft: string | undefined
+  /** Cursor index into the history array during a walk (origin = live draft). */
+  private walkCursor: number | undefined
   /** The mounted composer's file-picker opener (scoped pick-files event target). */
   private filePicker: Parameters<ComposerKeyboard['bindFilePicker']>[0] | undefined
   /** Default sends retained until admission settles or scope disposal releases their attachments. */
@@ -348,6 +354,13 @@ export class SessionInputShell implements SessionInput {
     const submission: MessageSubmission = Object.freeze({
       timestamp, mode, ...source === undefined ? {} : { source }, ...state === undefined ? {} : { state },
     })
+    // Record non-blank plain-text submissions into history and end any walk.
+    if (this.historyBinding !== undefined && this.snapshot.phase === 'plain') {
+      const submitted = this.snapshot.draft.trim()
+      if (submitted !== '') this.historyBinding.push(submitted)
+      this.stashedDraft = undefined
+      this.walkCursor = undefined
+    }
     if (this.snapshot.draft.trim() === '' && this.attachmentIds.length > 0) {
       if (this.snapshot.phase === 'plain') {
         const attachmentIds = [...this.attachmentIds]
@@ -559,6 +572,9 @@ export class SessionInputShell implements SessionInput {
     }
     this.disposed = true
     this.dispatchRun(({ type: 'release' }))
+    this.historyBinding = undefined
+    this.stashedDraft = undefined
+    this.walkCursor = undefined
     this.unsubscribeInbox?.()
     this.unregister()
     this.detachedDrafts.clear()
@@ -582,6 +598,75 @@ export class SessionInputShell implements SessionInput {
     return () => {
       if (this.persistDraft === write) this.persistDraft = undefined
     }
+  }
+
+  /**
+   * Bind the history source for PgUp/PgDn recall. The shell reads the history
+   * array and pushes recorded submissions through these accessors so navigation
+   * and capture stay consistent with the Conversation store.
+   * @param get - read the current history snapshot (newest last).
+   * @param push - record one submitted draft (store-owned dedup/cap policy).
+   * @returns the unbind disposer.
+   */
+  bindHistory(get: () => readonly string[], push: (text: string) => void): () => void {
+    this.historyBinding = { get, push }
+    return () => {
+      if (this.historyBinding?.get === get) this.historyBinding = undefined
+    }
+  }
+
+  /**
+   * Walk the bound history by one step. `older` travels toward the oldest
+   * entry, `newer` toward the live draft. The first `recall` from the live
+   * draft stashes it so the matching opposite `recall` restores it.
+   * @param direction - step toward the oldest (`older`) or the live draft (`newer`).
+   * @returns false when no history is bound or the walk cannot advance.
+   */
+  recall(direction: 'older' | 'newer'): boolean {
+    const binding = this.historyBinding
+    if (binding === undefined) return false
+    const history = binding.get()
+    if (history.length === 0) return false
+
+    const at = (index: number): string | undefined =>
+      index >= 0 && index < history.length ? history[index] : undefined
+
+    if (this.walkCursor === undefined) {
+      // First recall from the live draft: stash it, then step into the tail.
+      if (direction === 'newer') return false
+      this.stashedDraft = this.snapshot.draft
+      this.walkCursor = history.length - 1
+      const entry = at(this.walkCursor)
+      if (entry === undefined) return false
+      this.setDraft(entry)
+      return true
+    }
+
+    if (direction === 'older') {
+      if (this.walkCursor <= 0) return true // pinned at the oldest
+      this.walkCursor -= 1
+      const entry = at(this.walkCursor)
+      if (entry === undefined) return false
+      this.setDraft(entry)
+      return true
+    }
+
+    // direction === 'newer'
+    if (this.walkCursor >= history.length - 1) {
+      // At the newest entry: the next step restores the live draft and
+      // closes the walk. Returning true here so the consumer knows the
+      // gesture produced a result; the following recall('newer') sees
+      // walkCursor === undefined and returns false.
+      this.setDraft(this.stashedDraft ?? '')
+      this.stashedDraft = undefined
+      this.walkCursor = undefined
+      return true
+    }
+    this.walkCursor += 1
+    const entry = at(this.walkCursor)
+    if (entry === undefined) return false
+    this.setDraft(entry)
+    return true
   }
 
   /**

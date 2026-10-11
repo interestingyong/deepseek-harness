@@ -1477,7 +1477,11 @@ describe('WorkspaceBrowser', () => {
 
       await act(async () => { await vi.advanceTimersByTimeAsync(250) })
 
-      expect(searchSessions).toHaveBeenCalledWith('waterfall token', expect.any(AbortSignal))
+      expect(searchSessions).toHaveBeenCalledWith(
+        'waterfall token',
+        expect.any(AbortSignal),
+        { scope: 'current' },
+      )
       expect(screen.getByText('Research notes')).toBeTruthy()
       expect(screen.getByText('Research Workspace')).toBeTruthy()
       expect(screen.getByText('…the waterfall token appears here…')).toBeTruthy()
@@ -1493,6 +1497,37 @@ describe('WorkspaceBrowser', () => {
       expect(screen.getByRole('button', { name: '收起' })).toBeTruthy()
       expect(scrollIntoView).toHaveBeenCalledWith({ block: 'nearest' })
       expect(scrollIntoView.mock.instances.at(-1)).toBe(targetRow)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('re-searches across all history when the scope toggle turns on', async () => {
+    vi.useFakeTimers()
+    try {
+      const searchSessions = vi.fn(async () => ({ items: [], hasMore: false }))
+      mount({ searchSessions })
+      fireEvent.click(screen.getByRole('button', { name: '搜索会话' }))
+      const input = screen.getByPlaceholderText('搜索会话…')
+      fireEvent.change(input, { target: { value: 'needle' } })
+      await act(async () => { await vi.advanceTimersByTimeAsync(250) })
+      expect(searchSessions).toHaveBeenLastCalledWith(
+        'needle',
+        expect.any(AbortSignal),
+        { scope: 'current' },
+      )
+
+      const toggle = screen.getByRole('button', { name: '搜索全部历史（含已压缩的对话）' })
+      expect(toggle.getAttribute('aria-pressed')).toBe('false')
+      fireEvent.click(toggle)
+      expect(toggle.getAttribute('aria-pressed')).toBe('true')
+      await act(async () => { await vi.advanceTimersByTimeAsync(250) })
+      expect(searchSessions).toHaveBeenCalledTimes(2)
+      expect(searchSessions).toHaveBeenLastCalledWith(
+        'needle',
+        expect.any(AbortSignal),
+        { scope: 'all' },
+      )
     } finally {
       vi.useRealTimers()
     }
@@ -1671,7 +1706,7 @@ describe('WorkspaceBrowser', () => {
       expect(input.value).not.toContain('\0')
       await act(async () => { await vi.advanceTimersByTimeAsync(250) })
       expect(searchSessions).toHaveBeenCalledOnce()
-      expect(searchSessions).toHaveBeenCalledWith(expected, expect.any(AbortSignal))
+      expect(searchSessions).toHaveBeenCalledWith(expected, expect.any(AbortSignal), { scope: 'current' })
     } finally {
       vi.useRealTimers()
     }

@@ -24,7 +24,7 @@ describe('keymap keydown routing', () => {
     editor.setRootElement(first)
     const unregister = registerComposerKeymap(editor, {
       arbitrate: () => 'pass', space: () => false, dismissPopup: () => {},
-      canSubmit: () => false, submit: () => {}, intakeFiles: () => {}, pasteText: () => {},
+      canSubmit: () => false, submit: () => {}, intakeFiles: () => {}, pasteText: () => {}, recall: () => false,
     })
     onTestFinished(unregister)
     fireEvent.compositionStart(first)
@@ -60,6 +60,7 @@ describe('keymap keydown routing', () => {
       submit,
       intakeFiles: () => {},
       pasteText: () => {},
+      recall: () => false,
     })
     fireEvent.keyDown(root, { key: 'Enter' })
     expect(submit).toHaveBeenCalledWith(false)
@@ -87,7 +88,7 @@ describe('keymap keydown routing', () => {
     const arbitrate = vi.fn(() => 'pass' as const)
     onTestFinished(registerComposerKeymap(editor, {
       arbitrate, space: () => false, dismissPopup: () => {}, canSubmit: () => true,
-      submit, intakeFiles: () => {}, pasteText: () => {},
+      submit, intakeFiles: () => {}, pasteText: () => {}, recall: () => false,
     }))
     editor.update(() => {
       const paragraph = $createParagraphNode().append($createTextNode('unsent draft'))
@@ -128,6 +129,7 @@ describe('keymap keydown routing', () => {
       submit: () => {},
       intakeFiles: () => {},
       pasteText: () => {},
+      recall: () => false,
     })
     const consumed = fireEvent.keyDown(root, { key: 'Tab', keyCode: 9 })
     expect(arbitrate).toHaveBeenCalledWith('tab', false)
@@ -140,5 +142,39 @@ describe('keymap keydown routing', () => {
     // Shift+Tab is the menu's exit key, never its settle key.
     fireEvent.keyDown(root, { key: 'Tab', keyCode: 9, shiftKey: true })
     expect(arbitrate).toHaveBeenLastCalledWith('tabBack', false)
+  })
+
+  it('routes ArrowUp/ArrowDown to recall when no menu claims them', () => {
+    const editor = createEditor({ namespace: 'keymap-routing', onError: (e) => { throw e } })
+    const root = document.createElement('div')
+    root.contentEditable = 'true'
+    document.body.appendChild(root)
+    editor.setRootElement(root)
+    registerPlainText(editor)
+    const recall = vi.fn<(direction: 'older' | 'newer') => boolean>()
+      .mockReturnValueOnce(true)
+      .mockReturnValueOnce(true)
+      .mockReturnValue(false)
+    registerComposerKeymap(editor, {
+      arbitrate: () => 'pass',
+      space: () => false,
+      dismissPopup: () => {},
+      canSubmit: () => true,
+      submit: () => {},
+      intakeFiles: () => {},
+      pasteText: () => {},
+      recall,
+    })
+    // ArrowUp → older recall applied (consumed: the arrow does not move the caret).
+    const up = fireEvent.keyDown(root, { key: 'ArrowUp' })
+    expect(recall).toHaveBeenCalledWith('older')
+    expect(up).toBe(false)
+    // ArrowDown → newer recall applied.
+    const down = fireEvent.keyDown(root, { key: 'ArrowDown' })
+    expect(recall).toHaveBeenCalledWith('newer')
+    expect(down).toBe(false)
+    // Third recall refused: the event is not consumed (native caret/default).
+    const refused = fireEvent.keyDown(root, { key: 'ArrowUp' })
+    expect(refused).toBe(true)
   })
 })

@@ -384,6 +384,7 @@ export function apply(ctx: Context, config: Config = Config({})): void {
           },
         },
         bindDraftPersistence: write => inputHub.shell(sessionId).bindDraftPersistence(write),
+        bindHistory: (get, push) => inputHub.shell(sessionId).bindHistory(get, push),
         openView,
       }
     },

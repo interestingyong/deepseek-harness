@@ -19,8 +19,8 @@ import {
   COMMAND_PRIORITY_CRITICAL, KEY_ARROW_DOWN_COMMAND, KEY_ARROW_UP_COMMAND, KEY_ENTER_COMMAND,
   KEY_ESCAPE_COMMAND, KEY_SPACE_COMMAND, KEY_TAB_COMMAND, PASTE_COMMAND,
 } from 'lexical'
-import { mergeRegister } from '@lexical/utils'
 import type { ArbitrateKey, ArbitrateOutcome } from '../../contract/draft-editor.ts'
+import { mergeRegister } from '@lexical/utils'
 
 /** The bar-supplied behavior behind each intercepted gesture. */
 export interface ComposerKeymapHandlers {
@@ -42,6 +42,12 @@ export interface ComposerKeymapHandlers {
   intakeFiles(files: readonly File[], directories?: ReadonlySet<File>): void
   /** Pasted plain text (sanitized insertion through the shell). */
   pasteText(text: string): void
+  /**
+   * Recall a prior submission via arrow keys on an empty draft. `older` walks
+   * toward the earliest entry, `newer` toward the live draft. Returns true
+   * when the recall applied — the caret stays put and the arrow is consumed.
+   */
+  recall(direction: 'older' | 'newer'): boolean
 }
 
 /** Composition state a keydown can trust (see the module doc's Safari note). */
@@ -86,8 +92,15 @@ export function registerComposerKeymap(editor: LexicalEditor, handlers: Composer
       event?.preventDefault()
       return true
     }
+    // No menu claimed the arrow: route to history recall on an empty draft.
+    const direction = key === 'up' ? 'older' : 'newer'
+    if (handlers.recall(direction)) {
+      event?.preventDefault()
+      return true
+    }
     return false
   }
+
 
   return mergeRegister(
     editor.registerRootListener((root, prevRoot) => {

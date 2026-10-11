@@ -193,7 +193,7 @@ describe('Conversation inject API', () => {
     const b = await bench()
     const { injected } = b.conversationApi(ROOT)
     expect(b.sessionFake.loadOlder).not.toHaveBeenCalled()
-    expect(Object.keys(injected)).toEqual(['hooks', 'bindDraftPersistence', 'openView'])
+    expect(Object.keys(injected)).toEqual(['hooks', 'bindDraftPersistence', 'bindHistory', 'openView'])
     expect(b.viewSource(ROOT).getSnapshot()).toEqual([])
     await b.runtime.dispose()
   })
@@ -455,6 +455,7 @@ describe('Conversation inject API', () => {
       arbitrate: () => 'pass', space: () => false, dismissPopup: () => {},
       canSubmit: () => true, submit: () => {}, pasteText: (text) => { composer.keyboard!.paste(text) },
       intakeFiles: (files, directories) => { expect(composer.addFiles?.(files, directories)).toBeNull() },
+      recall: () => false,
     })
     onTestFinished(off)
     const folder = new File([], 'my project')

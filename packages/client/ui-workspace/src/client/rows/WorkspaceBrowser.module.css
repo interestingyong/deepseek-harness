@@ -248,6 +248,34 @@
   background: var(--dsw-alias-interactive-bg-hover);
 }
 
+/* Search-scope toggle: shares the clear button's geometry; the pressed state
+   tints with the platform accent so the widened scope survives pointer leave. */
+.scopeToggle {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border: none;
+  border-radius: 50%;
+  corner-shape: round;
+  padding: 0;
+  background: transparent;
+  cursor: pointer;
+  color: var(--dsw-alias-label-secondary);
+}
+
+.scopeToggle:hover {
+  background: var(--dsw-alias-interactive-bg-hover);
+}
+
+.scopeToggleActive,
+.scopeToggleActive:hover {
+  color: var(--dsw-alias-brand-primary-new-colorprimary-new-color);
+  background: color-mix(in srgb, var(--dsw-alias-brand-primary-new-colorprimary-new-color) 12%, transparent);
+}
+
 /* Rail variant (own .rail class from the wide owner prop — the region never
    reads the shell's class names): the two icon controls stack as 36x36
    circles matching the shell's rail rhythm. Both use the rail's shared base

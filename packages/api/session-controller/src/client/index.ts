@@ -23,6 +23,7 @@ export type {
   SessionEventStreamOptions,
   SessionJournalChange,
   SessionRemote,
+  SessionSearchScope,
 } from './transport.ts'
 export { createScope, scopeOf } from './scope.ts'
 export type { AgentContext, AgentScopeHandle } from './scope.ts'

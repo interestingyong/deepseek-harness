@@ -424,8 +424,8 @@ describe('sessions', () => {
       value: { items: [{ sessionId: 's1', snippet: 'hit: marker' }], hasMore: true },
     })
     expect(runtime.sessions.calls).toEqual([
-      { method: 'search', args: ['marker', signal] },
-      { method: 'search', args: ['marker', signal] },
+      { method: 'search', args: ['marker', signal, undefined] },
+      { method: 'search', args: ['marker', signal, undefined] },
     ])
     await runtime.dispose()
   })

@@ -17,7 +17,7 @@ import {
 } from './types.ts'
 import type {
   SessionListMetadata, SessionProjectionHints, SessionProjectionValues, SessionSearchItem,
-  SessionSearchValue, SessionSummary,
+  SessionSearchRequest, SessionSearchValue, SessionSummary,
 } from './types.ts'
 
 const SEARCH_PROVIDER_CALL_LIMIT = 100
@@ -181,13 +181,16 @@ export class ApiSessionList {
   }
 
   /**
-   * Search current visible message content without activating any matching Session.
-   * @param query - literal message-content query.
+   * Search visible message content without activating any matching Session.
+   * `scope: 'all'` lifts the current-surface restriction so messages shadowed
+   * by a later compaction also match; every other authorization stays fixed.
+   * @param request - literal message-content query and optional surface scope.
    * @param signal - cancellation for list and search reads.
    * @returns authorized bounded Session search results.
    */
-  async search(query: string, signal: AbortSignal): Promise<SessionSearchValue> {
-    const normalizedQuery = normalizeSearchQuery(query)
+  async search(request: SessionSearchRequest, signal: AbortSignal): Promise<SessionSearchValue> {
+    const normalizedQuery = normalizeSearchQuery(request.query)
+    const currentOnly = request.scope !== 'all'
     signal.throwIfAborted()
     const provider = this.ctx.get('sessionQuery')
     if (provider === undefined) {
@@ -224,7 +227,7 @@ export class ApiSessionList {
             query: normalizedQuery,
             eventFilters: [
               { kind: 'type', values: ['user/message', 'assistant/message'] },
-              { kind: 'surface', values: ['current'] },
+              ...currentOnly ? [{ kind: 'surface', values: ['current'] } as const] : [],
             ],
             limit: requestedLimit,
             ...(requestedCursor === undefined ? {} : { cursor: requestedCursor }),
@@ -257,7 +260,7 @@ export class ApiSessionList {
           if (authorized.length > SESSION_SEARCH_RESULT_LIMIT) continue
           if (!visibleIds.has(hit.header.id)
             || hit.bestMatch.sessionId !== hit.header.id
-            || hit.bestMatch.surface !== 'current'
+            || (currentOnly && hit.bestMatch.surface !== 'current')
             || !MESSAGE_TYPES.has(hit.bestMatch.type)
             || acceptedIds.has(hit.header.id)) continue
           acceptedIds.add(hit.header.id)

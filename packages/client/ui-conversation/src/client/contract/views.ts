@@ -23,4 +23,6 @@ export interface ConversationStoreState {
   view: string | null
   /** Focus request consumed and acknowledged by the addressed View. */
   viewRequest: ConversationViewRequest | null
+  /** Recent non-blank submissions (newest last, capped at 200) for PgUp/PgDn recall. */
+  history: readonly string[]
 }

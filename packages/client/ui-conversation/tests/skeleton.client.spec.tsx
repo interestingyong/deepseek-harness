@@ -259,6 +259,7 @@ function mount(
           actions={store.actions}
           renderSlot={renderSlot as never}
           bindDraftPersistence={write => wiring.bindDraftPersistence(write)}
+          bindHistory={() => () => {}}
           openView={(view, focus) => { store.actions.openView(view, focus) }}
         />
       )
